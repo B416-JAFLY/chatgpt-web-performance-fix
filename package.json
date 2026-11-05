@@ -9,6 +9,7 @@
     "analyze:pagination": "bun run analysis/analyze-pagination.ts",
     "analyze:richtext": "bun run analysis/analyze-richtext.ts",
     "benchmark": "bun run bench/benchmark.ts",
+    "benchmark:browser": "bun run build && bun run bench/browser-benchmark.ts",
     "test": "bun test",
     "test:browser": "bun run build && bun run tests/browser-harness.ts",
     "build": "bun run scripts/build.ts",
@@ -19,7 +20,7 @@
     "test:rich-browser": "bun run build && bun run tests/rich-text-browser.ts",
     "test:safari": "bun run build && python3 tests/safari_mcp_runner.py"
   },
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Tampermonkey userscript for improving ChatGPT long-conversation performance.",
   "license": "MIT",
   "repository": {

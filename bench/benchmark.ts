@@ -3,10 +3,7 @@ import { optimizeConversationPayload, type ConversationPayload } from "../src/op
 import { loadCapturedConversation, traceActivePath } from "../tests/helpers";
 import { hasPrivateCapture } from "../analysis/lib/private-paths";
 
-if (!hasPrivateCapture()) {
-  console.log("Skipping capture benchmark: .private capture data is not available.");
-  process.exit(0);
-}
+const usingPrivateCapture = hasPrivateCapture();
 
 interface Distribution {
   minMs: number;
@@ -88,6 +85,7 @@ const report = {
     platform: process.platform,
     arch: process.arch,
     iterations,
+    source: usingPrivateCapture ? "private-capture" : "synthetic-capture",
   },
   capture: {
     originalBytes: Buffer.byteLength(originalText),

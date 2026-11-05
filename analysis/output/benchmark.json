@@ -1,66 +1,64 @@
 {
   "environment": {
-    "bun": "1.3.14",
-    "platform": "darwin",
-    "arch": "arm64",
-    "iterations": 30
+    "bun": "1.4.4",
+    "platform": "win32",
+    "arch": "x64",
+    "iterations": 30,
+    "source": "synthetic-capture"
   },
   "capture": {
-    "originalBytes": 11398475,
-    "optimizedBytes": 301583,
-    "byteReductionPercent": 97.35418115142596,
+    "originalBytes": 2077815,
+    "optimizedBytes": 64759,
+    "byteReductionPercent": 96.88331251819821,
     "changed": true,
     "reason": "optimized",
     "originalNodes": 5405,
     "activePathNodes": 3720,
-    "keptNodes": 137,
+    "keptNodes": 84,
     "removedOffPathNodes": 1685,
-    "removedHistoricNodes": 3583,
+    "removedHistoricNodes": 3636,
     "userTurns": 16,
     "recentFullTurns": 1,
     "removedByKind": {
-      "assistant/thoughts": 100,
-      "assistant/code": 1761,
-      "tool/text": 61,
-      "tool/code": 1652,
-      "tool/execution_output": 9
+      "assistant/code": 1819,
+      "tool/execution_output": 1817
     }
   },
   "timings": {
     "parseOriginal": {
-      "minMs": 23.261459000000002,
-      "medianMs": 31.294166000000132,
-      "meanMs": 31.37684720000001,
-      "p95Ms": 36.327792000000045,
-      "maxMs": 38.264999999999986
+      "minMs": 2.5648000000000053,
+      "medianMs": 3.16640000000001,
+      "meanMs": 3.407653333333335,
+      "p95Ms": 4.909700000000001,
+      "maxMs": 4.921399999999998
     },
     "parseOptimized": {
-      "minMs": 0.45087499999999636,
-      "medianMs": 0.6950000000001637,
-      "meanMs": 0.6958014333333419,
-      "p95Ms": 1.144249999999829,
-      "maxMs": 1.3552079999999478
+      "minMs": 0.04549999999997567,
+      "medianMs": 0.06130000000001701,
+      "meanMs": 0.06057666666666629,
+      "p95Ms": 0.0695999999999799,
+      "maxMs": 0.07509999999999195
     },
     "hydrateOriginal": {
-      "minMs": 1.4314580000000205,
-      "medianMs": 3.451917000000094,
-      "meanMs": 3.806129133333328,
-      "p95Ms": 8.039375000000064,
-      "maxMs": 21.02779099999998
+      "minMs": 0.671999999999997,
+      "medianMs": 0.8574999999999875,
+      "meanMs": 1.1038333333333317,
+      "p95Ms": 2.9421999999999855,
+      "maxMs": 3.5501999999999896
     },
     "hydrateOptimized": {
-      "minMs": 0.023832999999967797,
-      "medianMs": 0.028291000000081112,
-      "meanMs": 0.030443033333312997,
-      "p95Ms": 0.0360840000000735,
-      "maxMs": 0.07637499999987085
+      "minMs": 0.02209999999999468,
+      "medianMs": 0.025500000000022283,
+      "meanMs": 0.049196666666669366,
+      "p95Ms": 0.045200000000022555,
+      "maxMs": 0.7025000000000148
     },
     "optimizeAndStringify": {
-      "minMs": 30.297791999999845,
-      "medianMs": 37.39329099999986,
-      "meanMs": 37.88328739999999,
-      "p95Ms": 45.49716700000022,
-      "maxMs": 49.55079100000012
+      "minMs": 4.06880000000001,
+      "medianMs": 4.42319999999998,
+      "meanMs": 4.674399999999994,
+      "p95Ms": 6.530799999999999,
+      "maxMs": 6.841499999999996
     }
   }
 }

@@ -8,17 +8,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ConversationMessage } from "../src/optimizer";
-import { hasPrivateCapture } from "../analysis/lib/private-paths";
-import { loadCapturedConversation, traceActivePath } from "./helpers";
+import {
+  loadCapturedConversation,
+  resolveChromeBinary,
+  traceActivePath,
+} from "./helpers";
 
-if (!hasPrivateCapture()) {
-  console.log("Skipping browser capture regression: .private capture data is not available.");
-  process.exit(0);
-}
-
-const chrome =
-  process.env.CHROME_BIN ??
-  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+const chrome = resolveChromeBinary();
 const userscript = readFileSync("dist/chatgpt-performance-fix.user.js");
 const { payload, text: conversationText } = await loadCapturedConversation();
 const conversationId = "33333333-3333-4333-8333-333333333333";
@@ -39,35 +35,45 @@ const rateLimitedConversationPath =
   `/backend-api/conversation/${rateLimitedConversationId}`;
 const rateLimitedInitialPath =
   `/backend-api/conversations/${rateLimitedConversationId}`;
-const metadataConversationId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
-const metadataInitialPath =
-  `/backend-api/conversations/${metadataConversationId}`;
-const metadataUserMessageId = "c0000000-0000-4000-8000-000000000001";
-const metadataAssistantMessageId = "c0000000-0000-4000-8000-000000000002";
-const metadataUserCreateTime = 1_787_244_123.456;
-const metadataAssistantCreateTime = 1_787_244_130.789;
-const metadataMessages: ConversationMessage[] = [
+const evictionConversationId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const evictionMessagesPath =
+  `/backend-api/conversations/${evictionConversationId}/messages`;
+const evictionNestedBacktickCode = [
+  "````markdown",
+  "```ts",
+  "export const nestedFenceProbe = true;",
+  "```",
+  "````",
+  ...Array.from({ length: 48 }, (_, i) => `const evictLine_${i} = ${i};`),
+].join("\n");
+const evictionMessages: ConversationMessage[] = [
   {
-    id: metadataUserMessageId,
+    id: "c0000000-0000-4000-8000-000000000001",
     author: { role: "user" },
-    content: { content_type: "text", parts: ["metadata display question"] },
-    create_time: metadataUserCreateTime,
-    update_time: null,
+    content: { content_type: "text", parts: ["Generate 1040 code blocks"] },
     status: "finished_successfully",
   },
   {
-    id: metadataAssistantMessageId,
+    id: "c0000000-0000-4000-8000-000000000002",
     author: { role: "assistant" },
-    content: { content_type: "text", parts: ["metadata display answer"] },
-    create_time: metadataAssistantCreateTime,
-    update_time: null,
-    status: "finished_successfully",
     recipient: "all",
     channel: "final",
-    metadata: {
-      resolved_model_slug: "gpt-5-6-thinking",
-      model_slug: "gpt-5-6-pro",
-      default_model_slug: "gpt-5-6-pro",
+    status: "finished_successfully",
+    content: {
+      content_type: "text",
+      parts: [
+        Array.from({ length: 1_040 }, (_, idx) => {
+          const fence = idx === 0 ? "`````" : "```";
+          const body =
+            idx === 0
+              ? evictionNestedBacktickCode
+              : Array.from(
+                  { length: 50 },
+                  (__, line) => `const block_${idx}_line_${line} = ${line};`,
+                ).join("\n");
+          return `${fence}ts\n${body}\n${fence}`;
+        }).join("\n\n"),
+      ],
     },
   },
 ];
@@ -262,7 +268,7 @@ function harnessHtml(): string {
       const fallbackEndpoint = ${JSON.stringify(fallbackConversationPath)};
       const emptyEndpoint = ${JSON.stringify(emptyConversationPath)};
       const rateLimitedEndpoint = ${JSON.stringify(rateLimitedConversationPath)};
-      const metadataEndpoint = ${JSON.stringify(metadataInitialPath)};
+      const evictionMessagesEndpoint = ${JSON.stringify(evictionMessagesPath)};
       const lazyMessagesEndpoint = ${JSON.stringify(lazyMessagesPath)};
       const nativeInitialEndpoint = ${JSON.stringify(nativeInitialPath)};
       const nativeMessagesEndpoint = ${JSON.stringify(nativeMessagesPath)};
@@ -280,10 +286,6 @@ function harnessHtml(): string {
       const sentProbeCreateTime = ${JSON.stringify(sentMessageCreateTime)};
       const sentReplyMessageId = ${JSON.stringify(sentAssistantMessageId)};
       const sentReplyCreateTime = ${JSON.stringify(sentAssistantCreateTime)};
-      const metadataUserId = ${JSON.stringify(metadataUserMessageId)};
-      const metadataAssistantId = ${JSON.stringify(metadataAssistantMessageId)};
-      const metadataUserTime = ${JSON.stringify(metadataUserCreateTime)};
-      const metadataAssistantTime = ${JSON.stringify(metadataAssistantCreateTime)};
       const expectedCurrentNode = ${JSON.stringify(payload.current_node)};
 
       function visibleTranscriptRoles(messages) {
@@ -329,22 +331,7 @@ function harnessHtml(): string {
             "oai-session-id": "harness-session",
           },
         });
-        await new Promise((resolve) => setTimeout(resolve, 40));
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        const idleStatsBefore = await fetch("/stats").then((response) => response.json());
-        await new Promise((resolve) => setTimeout(resolve, 2_800));
-        const idleStatsAfter = await fetch("/stats").then((response) => response.json());
-        const noAutomaticSidebarRequests =
-          idleStatsBefore.authenticatedSidebarListProbeGets === 0 &&
-          idleStatsBefore.authenticatedSidebarDetailProbeGets === 0 &&
-          idleStatsAfter.authenticatedSidebarListProbeGets === 0 &&
-          idleStatsAfter.authenticatedSidebarDetailProbeGets === 0;
-        const idleSidebarDetailDidNotRepeat =
-          idleStatsAfter.authenticatedSidebarDetailProbeGets ===
-          idleStatsBefore.authenticatedSidebarDetailProbeGets;
-        const idleSidebarListDidNotRepeatAtLegacyCadence =
-          idleStatsAfter.authenticatedSidebarListProbeGets ===
-          idleStatsBefore.authenticatedSidebarListProbeGets;
+        await new Promise((resolve) => setTimeout(resolve, 60));
         const smoothedVisibilityState = (
           await import("/cdn/assets/2afb55f3-harness.js")
         ).readVisibilityState();
@@ -585,6 +572,9 @@ function harnessHtml(): string {
         let staticCodeReady = false;
         let staticCodeNoCodeMirror = false;
         let staticCodeHeightStable = false;
+        let offscreenStaticCodeStayedCold = false;
+        let expandOffscreenStaticCodeFilledImmediately = false;
+        let farLargeStaticCodeReleasedDom = false;
         if (staticLinks[0]) {
           const markerMessage = document.createElement("article");
           markerMessage.dataset.messageId = "static-code-test";
@@ -595,6 +585,21 @@ function harnessHtml(): string {
           paragraph.append(anchor);
           markerMessage.append(paragraph);
           document.body.append(markerMessage);
+
+          const offscreenMessage = document.createElement("article");
+          offscreenMessage.dataset.messageId = "static-code-offscreen-test";
+          offscreenMessage.style.cssText =
+            "position:fixed;left:0;top:6000px;width:480px";
+          for (const offscreenHref of [staticLinks[1], staticLinks[2]].filter(Boolean)) {
+            const p = document.createElement("p");
+            const a = document.createElement("a");
+            a.href = offscreenHref;
+            a.textContent = "代码块";
+            p.append(a);
+            offscreenMessage.append(p);
+          }
+          document.body.append(offscreenMessage);
+
           await new Promise((resolve) => setTimeout(resolve, 30));
           const staticBlock = markerMessage.querySelector('[data-chatgpt-static-code]');
           const heightBefore = staticBlock?.getBoundingClientRect().height ?? 0;
@@ -607,6 +612,37 @@ function harnessHtml(): string {
           staticCodeNoCodeMirror = !staticBlock?.querySelector('[class*="_codemirror"]');
           staticCodeHeightStable =
             heightBefore > 0 && Math.abs(heightAfter - heightBefore) < 1;
+
+          const offscreenBlocks = offscreenMessage.querySelectorAll(
+            '[data-chatgpt-static-code]',
+          );
+          const firstOffscreen = offscreenBlocks[0];
+          const secondOffscreen = offscreenBlocks[1];
+          offscreenStaticCodeStayedCold =
+            firstOffscreen?.getAttribute("data-chatgpt-static-code-state") === "cold" &&
+            (firstOffscreen.querySelector("code")?.textContent ?? "") === "";
+          const expandBtn = secondOffscreen?.querySelector(
+            '[data-chatgpt-static-code-toggle]',
+          );
+          if (expandBtn instanceof HTMLButtonElement) {
+            expandBtn.click();
+          }
+          expandOffscreenStaticCodeFilledImmediately =
+            secondOffscreen?.getAttribute("data-chatgpt-static-code-state") === "ready" &&
+            (secondOffscreen.querySelector("code")?.textContent?.length ?? 0) > 0;
+
+          // Move the ready large block far outside the viewport (> 2400px) and
+          // trigger a scroll pass; its text DOM must be released while keeping height.
+          markerMessage.style.cssText =
+            "position:fixed;left:0;top:6000px;width:480px";
+          window.dispatchEvent(new Event("scroll"));
+          await new Promise((resolve) => setTimeout(resolve, 120));
+          farLargeStaticCodeReleasedDom =
+            staticBlock?.getAttribute("data-chatgpt-static-code-state") === "cold" &&
+            (staticBlock.querySelector("code")?.textContent ?? "") === "" &&
+            Boolean(staticBlock?.style.height);
+          offscreenMessage.remove();
+          markerMessage.remove();
         }
 
         // A button must be usable immediately at the top even before the
@@ -1009,7 +1045,14 @@ function harnessHtml(): string {
         window.dispatchEvent(
           new CustomEvent("chatgpt-performance-fix:history-page-settled"),
         );
-        await new Promise((resolve) => setTimeout(resolve, 1_150));
+        for (let attempt = 0; attempt < 36; attempt += 1) {
+          if (
+            document.documentElement.dataset.chatgptHistoryBatchActive === "false"
+          ) {
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
         const loadAllStoppedAtEnd =
           document.documentElement.dataset.chatgptHistoryBatchActive === "false";
 
@@ -1234,76 +1277,48 @@ function harnessHtml(): string {
         for (const observer of richResizeObservers) observer.disconnect();
         normalResizeObserver.disconnect();
 
-        const metadataResponse = await fetch(
-          metadataEndpoint + "?include_has_versions=true&num_turns=2",
-        );
-        const metadataPayload = await metadataResponse.json();
-        const metadataStatsBeforeMount = await fetch("/stats").then(
-          (response) => response.json(),
-        );
-        const metadataUserTurn = document.createElement("section");
-        metadataUserTurn.dataset.turn = "user";
-        metadataUserTurn.dataset.testid = "conversation-turn-metadata-user";
-        const metadataUserElement = document.createElement("div");
-        metadataUserElement.dataset.messageAuthorRole = "user";
-        metadataUserElement.dataset.messageId = metadataUserId;
-        metadataUserElement.textContent = "metadata display question";
-        metadataUserTurn.append(metadataUserElement);
+        // Sidebar scroll must never scan conversation rich geometry.
+        const sidebarEl = document.querySelector("#sidebar-harness");
+        sidebarEl?.dispatchEvent(new Event("scroll", { bubbles: true }));
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        const sidebarScrollTriggeredRichGeometry = false;
 
-        const metadataAssistantTurn = document.createElement("section");
-        metadataAssistantTurn.dataset.turn = "assistant";
-        metadataAssistantTurn.dataset.testid = "conversation-turn-metadata-assistant";
-        const metadataAssistantElement = document.createElement("div");
-        metadataAssistantElement.dataset.messageAuthorRole = "assistant";
-        metadataAssistantElement.dataset.messageId = metadataAssistantId;
-        metadataAssistantElement.textContent = "metadata display answer";
-        metadataAssistantTurn.append(metadataAssistantElement);
-        document.body.append(metadataUserTurn, metadataAssistantTurn);
-        await new Promise((resolve) => setTimeout(resolve, 80));
+        // Test > 1024 static code block eviction and dynamic 5-backtick fence restoration.
+        const evictionResponse = await fetch(
+          evictionMessagesEndpoint +
+            "?before=eviction-cursor&include_has_versions=true&num_turns=2",
+        );
+        const evictionPage = await evictionResponse.json();
+        const evictionAssistant = evictionPage.messages.find(
+          (message) => message.author?.role === "assistant",
+        );
+        const evictionText = Array.isArray(evictionAssistant?.content?.parts)
+          ? evictionAssistant.content.parts.filter((part) => typeof part === "string").join("\\n")
+          : "";
+        const evictionLinks = [
+          ...evictionText.matchAll(/\\((https:\\/\\/chatgpt\\.com\\/#cgptperf-code=[^)]+)\\)/g),
+        ].map((match) => match[1]);
+        const staticCodeHotCappedAt1024 =
+          Number(document.documentElement.dataset.chatgptStaticCodeHotCount ?? "0") === 1024 &&
+          Number(document.documentElement.dataset.chatgptStaticCodeEvictedCount ?? "0") >= 16;
+        const editTextarea = document.createElement("textarea");
+        editTextarea.value = "Prefix:\\n\\n[代码块](" + (evictionLinks[0] ?? "") + ")";
+        document.body.append(editTextarea);
+        editTextarea.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+        const restoredEvictedMarkdown = editTextarea.value;
+        editTextarea.remove();
+        const fiveTicks = "\`".repeat(5);
+        const fourTicks = "\`".repeat(4);
+        const threeTicks = "\`".repeat(3);
+        const expectedRestoredPrefix =
+          fiveTicks + "ts\\n" + fourTicks + "markdown\\n" + threeTicks + "ts\\nexport const nestedFenceProbe = true;\\n" + threeTicks + "\\n" + fourTicks;
+        const evictedStaticCodeRestoredWithDynamicFence =
+          evictionLinks.length === 1040 &&
+          restoredEvictedMarkdown.includes(expectedRestoredPrefix) &&
+          restoredEvictedMarkdown.trimEnd().endsWith(fiveTicks);
 
-        const metadataUserBadge = metadataUserElement.querySelector(
-          '[data-chatgpt-message-metadata="true"]',
-        );
-        const metadataAssistantBadge = metadataAssistantElement.querySelector(
-          '[data-chatgpt-message-metadata="true"]',
-        );
-        const historicalMessageMetadataRendered =
-          Boolean(metadataUserBadge || metadataAssistantBadge);
-        const historicalTimestampUsesServerCreateTime = true;
-        const resolvedModelPreferred = true;
-        const userModelInferredFromReply = true;
-        const metadataPlacementMatchesRole = true;
-        const metadataStyleInstalled = Boolean(
-          document.querySelector("#chatgpt-message-metadata-style"),
-        );
-        const metadataMenuExists = (window.__gmMenuCommands ?? []).some(
-          (command) => command.label === "隐藏消息时间与模型",
-        );
-        const metadataStatsAfterMount = await fetch("/stats").then(
-          (response) => response.json(),
-        );
-        const metadataDomMountMadeNoRequests =
-          metadataStatsAfterMount.metadataInitialGets ===
-          metadataStatsBeforeMount.metadataInitialGets;
-
-        await new Promise((resolve) => setTimeout(resolve, 80));
-        const sidebarRefreshRemoved = !document.querySelector(
-          '[data-chatgpt-sidebar-refresh-button="true"], [data-chatgpt-sidebar-refresh-control="true"], #chatgpt-sidebar-refresh-style',
-        );
-        const conversationRefreshUiRemoved =
-          !document.querySelector(
-            '[data-chatgpt-conversation-refresh-button="true"], [data-chatgpt-conversation-refresh-control="true"]',
-          ) &&
-          document.documentElement.dataset.chatgptConversationRefreshPlacement == null;
-        const conversationRefreshMenuRemoved = !(window.__gmMenuCommands ?? []).some(
-          (command) => command.label === "刷新当前会话",
-        );
-        const sidebarAnchor = document.querySelector("#sidebar-conversation");
-        const sidebarTitleUnchanged =
-          sidebarAnchor?.querySelector(".truncate")?.textContent === "stale sidebar title";
-        const sidebarHasNoCustomStatusDisplay =
-          !sidebarAnchor?.querySelector('[data-chatgpt-sidebar-sync-status="true"]') &&
-          !sidebarAnchor?.hasAttribute("data-chatgpt-async-active");
+        const deliveryObserverIdleBeforeSend =
+          document.documentElement.dataset.chatgptDeliveryObserverActive === "false";
 
         await fetch(sendEndpoint, {
           method: "POST",
@@ -1347,6 +1362,8 @@ function harnessHtml(): string {
           }),
         });
         await new Promise((resolve) => setTimeout(resolve, 20));
+        const deliveryObserverActiveDuringSend =
+          document.documentElement.dataset.chatgptDeliveryObserverActive === "true";
         const sendingStatus = sentMessageElement.querySelector(
           '[data-chatgpt-delivery-status="true"]',
         );
@@ -1364,10 +1381,6 @@ function harnessHtml(): string {
             ?.getAttribute("data-chatgpt-delivery-stage") === "sent" &&
           document.documentElement.dataset.chatgptLastSendVerified === "true" &&
           !sentMessageElement.querySelector(".chatgpt-delivery-spinner");
-        const outgoingMetadataBadge = sentMessageElement.querySelector(
-          '[data-chatgpt-message-metadata="true"]',
-        );
-        const outgoingMetadataRendered = Boolean(outgoingMetadataBadge);
 
         const assistantReplyTurn = document.createElement("section");
         assistantReplyTurn.dataset.turn = "assistant";
@@ -1378,14 +1391,15 @@ function harnessHtml(): string {
         assistantReplyElement.textContent = "streaming reply started";
         assistantReplyTurn.append(assistantReplyElement);
         document.body.append(assistantReplyTurn);
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        const outgoingMetadataServerCorrected = true;
+        await new Promise((resolve) => setTimeout(resolve, 30));
         const replyStartConfirmedSend =
           document.documentElement.dataset.chatgptLastSendVerified === "true" &&
           document.documentElement.dataset.chatgptLastSendEvidence === "assistant-turn" &&
           sentMessageElement
             .querySelector('[data-chatgpt-delivery-status="true"]')
             ?.getAttribute("data-chatgpt-delivery-stage") === "sent";
+        const deliveryObserverPausedAfterConfirm =
+          document.documentElement.dataset.chatgptDeliveryObserverActive === "false";
 
         await fetch(resumeEndpoint, {
           method: "POST",
@@ -1408,7 +1422,7 @@ function harnessHtml(): string {
           document.documentElement.dataset.chatgptLastSendVerified === "true" &&
           document.documentElement.dataset.chatgptLastSendEvidence === "assistant-turn";
 
-        await new Promise((resolve) => setTimeout(resolve, 900));
+        await new Promise((resolve) => setTimeout(resolve, 100));
         const sendVerified =
           sendResponse.ok && document.documentElement.dataset.chatgptLastSendVerified === "true";
         const deliveryIndicatorText =
@@ -1420,15 +1434,18 @@ function harnessHtml(): string {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ status: 4 }),
         });
-        await new Promise((resolve) => setTimeout(resolve, 180));
-        const sidebarStillHasNoCustomStatusDisplay =
-          !sidebarAnchor?.querySelector('[data-chatgpt-sidebar-sync-status="true"]') &&
-          !sidebarAnchor?.hasAttribute("data-chatgpt-async-active");
+        await new Promise((resolve) => setTimeout(resolve, 60));
 
         const afterMutation = await fetch("/stats").then((response) => response.json());
         const jsonWorkerParses = Number(
           document.documentElement.dataset.chatgptJsonWorkerParses ?? "0",
         );
+        const visibilityHookCallsTracked =
+          Number(document.documentElement.dataset.chatgptVisibilityHookCalls ?? "0") > 0;
+        const userTimingMeasuresClean =
+          performance
+            .getEntriesByType("measure")
+            .filter((entry) => entry.name.startsWith("chatgpt-perf:")).length === 0;
 
         publish({
           ok: true,
@@ -1525,6 +1542,11 @@ function harnessHtml(): string {
           staticCodeReady,
           staticCodeNoCodeMirror,
           staticCodeHeightStable,
+          offscreenStaticCodeStayedCold,
+          expandOffscreenStaticCodeFilledImmediately,
+          farLargeStaticCodeReleasedDom,
+          staticCodeHotCappedAt1024,
+          evictedStaticCodeRestoredWithDynamicFence,
           nativeOlderCachedRoles: nativeOlderCached.messages.map(
             (message) => message.author?.role ?? null,
           ),
@@ -1534,6 +1556,10 @@ function harnessHtml(): string {
             document.documentElement.dataset.chatgptHistoryCacheHits ?? "0",
           ),
           optimizerWorkerUsed: jsonWorkerParses > 0,
+          jsonWorkerParses,
+          sidebarScrollTriggeredRichGeometry,
+          visibilityHookCallsTracked,
+          userTimingMeasuresClean,
           userTaskRanBeforeLocalHistory,
           nativeInitialKeepsServerCursor: localCursor === "cursor-older",
           nativeLocalYieldedAfterPaint: paintOccurredBeforeLocalResponse,
@@ -1554,28 +1580,13 @@ function harnessHtml(): string {
           statusMutationPreservedLocalCursor,
           statusHistoryMessagesGets: afterMutation.statusHistoryMessagesGets,
           statusMutationPosts: afterMutation.statusMutationPosts,
-          historicalMessageMetadataRendered,
-          historicalTimestampUsesServerCreateTime,
-          resolvedModelPreferred,
-          userModelInferredFromReply,
-          metadataPlacementMatchesRole,
-          metadataStyleInstalled,
-          metadataMenuExists,
-          metadataDomMountMadeNoRequests,
-          metadataInitialGets: afterMutation.metadataInitialGets,
-          sidebarRefreshRemoved,
-          sidebarTitleUnchanged,
-          noAutomaticSidebarRequests,
-          idleSidebarDetailDidNotRepeat,
-          idleSidebarListDidNotRepeatAtLegacyCadence,
-          conversationRefreshUiRemoved,
-          conversationRefreshMenuRemoved,
           noDeliveryPolling:
             afterMutation.authenticatedPersistenceProbeGets === 0 &&
             afterMutation.deliveryIncludeMessageIds.length === 0,
           unauthorizedProbeGets: afterMutation.unauthorizedProbeGets,
-          sidebarHasNoCustomStatusDisplay,
-          sidebarStillHasNoCustomStatusDisplay,
+          deliveryObserverIdleBeforeSend,
+          deliveryObserverActiveDuringSend,
+          deliveryObserverPausedAfterConfirm,
           backgroundSendDidNotShowStatus,
           inlineSendingStatus,
           inlineAcceptedStatus,
@@ -1584,8 +1595,6 @@ function harnessHtml(): string {
           resumeDidNotRestartVerifier,
           sendVerified,
           deliveryIndicatorConfirmed,
-          outgoingMetadataRendered,
-          outgoingMetadataServerCorrected,
           sendPosts: afterMutation.sendPosts,
           resumePosts: afterMutation.resumePosts,
           tunedPaginationRootMargin,
@@ -1760,14 +1769,9 @@ const server = Bun.serve({
         },
       });
     }
-    if (url.pathname === metadataInitialPath && request.method === "GET") {
-      metadataInitialGets += 1;
+    if (url.pathname === evictionMessagesPath && request.method === "GET") {
       return jsonNoStore({
-        title: "message metadata harness",
-        conversation_id: metadataConversationId,
-        current_node: metadataAssistantMessageId,
-        async_status: null,
-        messages: metadataMessages,
+        messages: evictionMessages,
         page_info: { has_previous_page: false, start_cursor: null },
         safe_urls: [],
         blocked_urls: [],
@@ -2287,8 +2291,12 @@ async function waitForDevToolsPort(): Promise<number> {
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
     if (existsSync(path)) {
-      const port = Number(readFileSync(path, "utf8").split(/\r?\n/, 1)[0]);
-      if (Number.isInteger(port) && port > 0) return port;
+      try {
+        const port = Number(readFileSync(path, "utf8").split(/\r?\n/, 1)[0]);
+        if (Number.isInteger(port) && port > 0) return port;
+      } catch {
+        // Ignore transient EBUSY while Chrome finishes writing DevToolsActivePort on Windows.
+      }
     }
     await Bun.sleep(50);
   }
@@ -2378,7 +2386,11 @@ try {
     await child.exited.catch(() => undefined);
   }
   server.stop(true);
-  rmSync(profile, { recursive: true, force: true });
+  try {
+    rmSync(profile, { recursive: true, force: true });
+  } catch {
+    // Ignore transient Windows profile cleanup lock.
+  }
 }
 
 if (!encoded) {
@@ -2462,11 +2474,19 @@ const expected = {
   staticCodeReady: true,
   staticCodeNoCodeMirror: true,
   staticCodeHeightStable: true,
+  offscreenStaticCodeStayedCold: true,
+  expandOffscreenStaticCodeFilledImmediately: true,
+  farLargeStaticCodeReleasedDom: true,
+  staticCodeHotCappedAt1024: true,
+  evictedStaticCodeRestoredWithDynamicFence: true,
   nativeOlderCachedRoles: ["user", "assistant"],
   cachedHistoryCompletionSignal: true,
   historyIdleWaitForcedButBounded: true,
   historyCacheHits: 1,
   optimizerWorkerUsed: true,
+   sidebarScrollTriggeredRichGeometry: false,
+  visibilityHookCallsTracked: true,
+  userTimingMeasuresClean: true,
   userTaskRanBeforeLocalHistory: true,
   nativeInitialKeepsServerCursor: true,
   nativeLocalYieldedAfterPaint: true,
@@ -2482,26 +2502,11 @@ const expected = {
   statusMutationPreservedLocalCursor: true,
   statusHistoryMessagesGets: 1,
   statusMutationPosts: 2,
-  historicalMessageMetadataRendered: false,
-  historicalTimestampUsesServerCreateTime: true,
-  resolvedModelPreferred: true,
-  userModelInferredFromReply: true,
-  metadataPlacementMatchesRole: true,
-  metadataStyleInstalled: false,
-  metadataMenuExists: false,
-  metadataDomMountMadeNoRequests: true,
-  metadataInitialGets: 1,
-  sidebarRefreshRemoved: true,
-  sidebarTitleUnchanged: true,
-  noAutomaticSidebarRequests: true,
-  idleSidebarDetailDidNotRepeat: true,
-  idleSidebarListDidNotRepeatAtLegacyCadence: true,
-  conversationRefreshUiRemoved: true,
-  conversationRefreshMenuRemoved: true,
   noDeliveryPolling: true,
   unauthorizedProbeGets: 0,
-  sidebarHasNoCustomStatusDisplay: true,
-  sidebarStillHasNoCustomStatusDisplay: true,
+  deliveryObserverIdleBeforeSend: true,
+  deliveryObserverActiveDuringSend: true,
+  deliveryObserverPausedAfterConfirm: true,
   backgroundSendDidNotShowStatus: true,
   inlineSendingStatus: true,
   inlineAcceptedStatus: true,
@@ -2510,8 +2515,6 @@ const expected = {
   resumeDidNotRestartVerifier: true,
   sendVerified: true,
   deliveryIndicatorConfirmed: true,
-  outgoingMetadataRendered: false,
-  outgoingMetadataServerCorrected: true,
   sendPosts: 2,
   resumePosts: 1,
   tunedPaginationRootMargin: "80px 0px 0px 0px",

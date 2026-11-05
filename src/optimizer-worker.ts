@@ -1,4 +1,5 @@
 import {
+  lightenPaginatedCodeBlocks,
   optimizeConversationPayload,
   optimizePaginatedConversationPayload,
   splitPaginatedMessagesNewestFirst,
@@ -7,6 +8,7 @@ import {
   type OptimizerOptions,
   type PaginatedChunkOptions,
   type PaginatedConversationPayload,
+  type StaticCodeBlock,
 } from "./optimizer";
 
 interface WorkerRequest {
@@ -18,16 +20,32 @@ interface WorkerRequest {
     | "start-paginated-job"
     | "prepend-paginated-job"
     | "finish-paginated-job"
-    | "cancel-paginated-job";
+    | "cancel-paginated-job"
+    | "cancel-conversation-jobs";
   text?: string;
   buffer?: ArrayBuffer;
   token?: string;
+  conversationId?: string;
   requireFinal?: boolean;
   lightweightCodeBlocks?: boolean;
   legacyOptions?: Partial<OptimizerOptions>;
   apiKind?: "paginated-initial" | "paginated-messages";
   recentFullTurns?: number;
   chunkOptions?: Partial<PaginatedChunkOptions>;
+}
+
+const MAX_PAGE_JOBS = 6;
+const MAX_PAGE_JOB_BYTES = 16 * 1024 * 1024;
+const MAX_PAGE_JOB_MESSAGES = 4_000;
+
+function requestInputByteLength(request: WorkerRequest): number {
+  if (request.buffer instanceof ArrayBuffer) {
+    return request.buffer.byteLength;
+  }
+  if (typeof request.text === "string") {
+    return request.text.length * 2;
+  }
+  return 0;
 }
 
 function parseRequestJson(request: WorkerRequest): any {
@@ -89,10 +107,21 @@ function requiredInitialMessageIds(payload: PaginatedConversationPayload): strin
 interface PageJob {
   payload: PaginatedConversationPayload;
   requireFinal: boolean;
+  conversationId: string | null;
+  approxBytes: number;
+  createdAt: number;
 }
 
 const pageJobs = new Map<string, PageJob>();
 let nextPageJobId = 1;
+
+function enforcePageJobLimits(): void {
+  while (pageJobs.size > MAX_PAGE_JOBS) {
+    const oldestKey = pageJobs.keys().next().value;
+    if (typeof oldestKey !== "string") break;
+    pageJobs.delete(oldestKey);
+  }
+}
 
 function isRenderableAssistantMessage(message: ConversationMessage): boolean {
   if (message.author?.role !== "assistant") return false;
@@ -160,123 +189,36 @@ function mergePagePayload(
 
 function pageProbe(token: string, job: PageJob) {
   const messages = Array.isArray(job.payload.messages) ? job.payload.messages : [];
+  const memoryLimitReached =
+    job.approxBytes >= MAX_PAGE_JOB_BYTES ||
+    messages.length >= MAX_PAGE_JOB_MESSAGES;
   const cursor =
+    !memoryLimitReached &&
     job.payload.page_info?.has_previous_page === true &&
     typeof job.payload.page_info.start_cursor === "string"
       ? job.payload.page_info.start_cursor
       : null;
   return {
     token,
-    complete: hasRenderablePair(messages, job.requireFinal),
+    complete: memoryLimitReached || hasRenderablePair(messages, job.requireFinal),
     cursor,
     messageCount: messages.length,
+    approxBytes: job.approxBytes,
+    memoryLimitReached,
   };
-}
-
-interface StaticCodeBlock {
-  token: string;
-  language: string;
-  code: string;
-  lineCount: number;
 }
 
 const staticCodeSession = Math.random().toString(36).slice(2);
 let nextStaticCodeId = 1;
 
-function extractFencedCodeBlocks(
-  text: string,
-  tokenPrefix: string,
-): { text: string; blocks: StaticCodeBlock[] } {
-  const lines = text.split("\n");
-  const candidates: Array<{
-    start: number;
-    end: number;
-    language: string;
-    code: string;
-  }> = [];
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const open = lines[index].match(/^\s*(`{3,}|~{3,})\s*([^`]*)$/);
-    if (!open) continue;
-    const fence = open[1];
-    const fenceChar = fence[0];
-    const closePattern = new RegExp(`^\\s*${fenceChar}{${fence.length},}\\s*$`);
-    let close = index + 1;
-    while (close < lines.length && !closePattern.test(lines[close])) close += 1;
-    if (close >= lines.length) continue;
-    const language = open[2].trim().split(/\s+/, 1)[0] ?? "";
-    const code = lines.slice(index + 1, close).join("\n");
-    candidates.push({ start: index, end: close, language, code });
-    index = close;
-  }
-
-  const totalCodeChars = candidates.reduce((sum, block) => sum + block.code.length, 0);
-  if (candidates.length < 4 && totalCodeChars < 8_000) {
-    return { text, blocks: [] };
-  }
-
-  const byStart = new Map(candidates.map((block) => [block.start, block]));
-  const output: string[] = [];
-  const blocks: StaticCodeBlock[] = [];
-  for (let index = 0; index < lines.length; index += 1) {
-    const block = byStart.get(index);
-    if (!block) {
-      output.push(lines[index]);
-      continue;
-    }
-    const token = `${staticCodeSession}-${tokenPrefix}-${nextStaticCodeId++}`;
-    const lineCount = Math.max(1, block.code.split("\n").length);
-    blocks.push({
-      token,
-      language: block.language,
-      code: block.code,
-      lineCount,
-    });
-    output.push(
-      `[代码块](https://chatgpt.com/#cgptperf-code=${token}&lines=${lineCount})`,
-    );
-    index = block.end;
-  }
-  return { text: output.join("\n"), blocks };
-}
-
 function lightenHeavyCodeBlocks(
   payload: PaginatedConversationPayload,
 ): { payload: PaginatedConversationPayload; codeBlocks: StaticCodeBlock[] } {
-  if (!Array.isArray(payload.messages)) return { payload, codeBlocks: [] };
-  const codeBlocks: StaticCodeBlock[] = [];
-  const messages = payload.messages.map((message, messageIndex) => {
-    if (
-      !["assistant", "user"].includes(String(message.author?.role)) ||
-      !Array.isArray(message.content?.parts)
-    ) {
-      return message;
-    }
-    let changed = false;
-    const parts = message.content.parts.map((part, partIndex) => {
-      if (typeof part !== "string") return part;
-      const result = extractFencedCodeBlocks(
-        part,
-        `m${messageIndex}p${partIndex}`,
-      );
-      if (result.blocks.length === 0) return part;
-      changed = true;
-      codeBlocks.push(...result.blocks);
-      return result.text;
-    });
-    if (!changed) return message;
-    return {
-      ...message,
-      content: {
-        ...message.content,
-        parts,
-      },
-    };
-  });
-  return {
-    payload: { ...payload, messages },
-    codeBlocks,
-  };
+  return lightenPaginatedCodeBlocks(
+    payload,
+    staticCodeSession,
+    () => nextStaticCodeId++,
+  );
 }
 
 function optimizePaginatedPayload(
@@ -292,6 +234,7 @@ function optimizePaginatedPayload(
     forceKeepMessageIds: initial ? requiredInitialMessageIds(payload) : [],
     collapseTurnsToQuestionAnswer:
       request.apiKind === "paginated-messages" || (initial && !active),
+    compactOversizedTurns: true,
   });
   const lightened =
     request.lightweightCodeBlocks === true && !active
@@ -333,10 +276,19 @@ self.addEventListener("message", (event: MessageEvent<WorkerRequest>) => {
     }
 
     if (request.operation === "start-paginated-job") {
+      const approxBytes = requestInputByteLength(request);
       const payload = parseRequestJson(request) as PaginatedConversationPayload;
       const token = `page-${nextPageJobId++}`;
-      const job = { payload, requireFinal: request.requireFinal === true };
+      const job: PageJob = {
+        payload,
+        requireFinal: request.requireFinal === true,
+        conversationId:
+          typeof request.conversationId === "string" ? request.conversationId : null,
+        approxBytes,
+        createdAt: Date.now(),
+      };
       pageJobs.set(token, job);
+      enforcePageJobLimits();
       self.postMessage({ id: request.id, ok: true, value: pageProbe(token, job) });
       return;
     }
@@ -345,8 +297,10 @@ self.addEventListener("message", (event: MessageEvent<WorkerRequest>) => {
       const token = request.token ?? "";
       const job = pageJobs.get(token);
       if (!job) throw new Error("Unknown paginated job");
+      const addedBytes = requestInputByteLength(request);
       const older = parseRequestJson(request) as PaginatedConversationPayload;
       job.payload = mergePagePayload(job.payload, older);
+      job.approxBytes += addedBytes;
       self.postMessage({ id: request.id, ok: true, value: pageProbe(token, job) });
       return;
     }
@@ -367,6 +321,19 @@ self.addEventListener("message", (event: MessageEvent<WorkerRequest>) => {
     if (request.operation === "cancel-paginated-job") {
       pageJobs.delete(request.token ?? "");
       self.postMessage({ id: request.id, ok: true, value: null });
+      return;
+    }
+
+    if (request.operation === "cancel-conversation-jobs") {
+      const targetConvId = request.conversationId;
+      let cancelled = 0;
+      for (const [token, job] of [...pageJobs.entries()]) {
+        if (!targetConvId || job.conversationId === targetConvId) {
+          pageJobs.delete(token);
+          cancelled += 1;
+        }
+      }
+      self.postMessage({ id: request.id, ok: true, value: { cancelled } });
       return;
     }
 

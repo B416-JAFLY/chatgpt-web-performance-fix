@@ -1,6 +1,7 @@
 import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveChromeBinary } from "./helpers";
 
 const script = readFileSync("dist/chatgpt-performance-fix.user.js", "utf8");
 const html = `<!doctype html><meta charset="utf-8"><script>
@@ -80,7 +81,7 @@ const server = Bun.serve({hostname:"127.0.0.1", port:0, fetch(req) {
 }});
 const profile = mkdtempSync(join(tmpdir(), "rich-text-test-"));
 try {
- const chrome = process.env.CHROME_BIN ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+ const chrome = resolveChromeBinary();
  const proc = Bun.spawn([chrome,"--headless=new","--disable-gpu","--no-first-run",`--user-data-dir=${profile}`,"--virtual-time-budget=12000","--dump-dom",server.url.href], {stdout:"pipe",stderr:"pipe"});
  const output = await new Response(proc.stdout).text();
  const error = await new Response(proc.stderr).text();

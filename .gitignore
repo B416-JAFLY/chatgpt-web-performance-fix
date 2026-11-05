@@ -22,6 +22,7 @@ dist/.build/
 # Analysis outputs are ignored by default; only sanitized aggregate reports are tracked.
 analysis/output/*
 !analysis/output/benchmark.json
+!analysis/output/ab-browser-benchmark.json
 !analysis/output/browser-harness.json
 !analysis/output/duplicate-requests.json
 !analysis/output/pagination-analysis.json

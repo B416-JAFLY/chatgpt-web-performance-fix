@@ -14,3 +14,8 @@ jobs:
           bun-version: latest
       - run: bun test
       - run: bun run build
+      - run: bun run test:rich-browser
+      - run: bun run test:browser
+      - run: bun run analyze:validation
+      - run: bun run benchmark
+      - run: bun run benchmark:browser

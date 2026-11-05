@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
   clampPaginatedNumTurns,
+  computeMarkdownCodeFence,
   convertNativeInitialToLazyConversation,
+  extractFencedCodeBlocks,
   isLegacyFullConversationUrl,
+  lightenPaginatedCodeBlocks,
   matchConversationApiUrl,
   optimizeConversationPayload,
   optimizePaginatedConversationPayload,
@@ -319,5 +322,103 @@ describe("conversation API URL matcher", () => {
       2,
     );
     expect(new URL(alreadySmall).searchParams.get("num_turns")).toBe("1");
+  });
+});
+
+describe("static code markdown fence & oversized turn strategies", () => {
+  test("computeMarkdownCodeFence chooses a fence longer than any backtick run in code", () => {
+    expect(computeMarkdownCodeFence("const x = 1;")).toBe("```");
+    expect(computeMarkdownCodeFence("const md = '```js\\ncode\\n```';")).toBe("````");
+    expect(computeMarkdownCodeFence("nested ````markdown\n```ts\n```\n````")).toBe("`````");
+    expect(computeMarkdownCodeFence("deep `````` six backticks")).toBe("```````");
+  });
+
+  test("extractFencedCodeBlocks and lightenPaginatedCodeBlocks lighten oversized single-block code", () => {
+    const giantCode = Array.from({ length: 120 }, (_, i) => `const line_${i} = "${"x".repeat(40)}";`).join("\n");
+    const payload = {
+      messages: [
+        {
+          id: "u1",
+          author: { role: "user" },
+          content: { content_type: "text", parts: ["Show giant file"] },
+        },
+        {
+          id: "a1",
+          author: { role: "assistant" },
+          channel: "final",
+          recipient: "all",
+          content: {
+            content_type: "text",
+            parts: [`Here is the file:\n\`\`\`ts\n${giantCode}\n\`\`\``],
+          },
+        },
+      ],
+    };
+    let seq = 0;
+    const lightened = lightenPaginatedCodeBlocks(
+      payload,
+      "test",
+      () => {
+        seq += 1;
+        return seq;
+      },
+      2_048,
+    );
+    expect(lightened.codeBlocks).toHaveLength(1);
+    expect(lightened.codeBlocks[0].code).toBe(giantCode);
+    const partText = String(lightened.payload.messages?.[1]?.content?.parts?.[0] ?? "");
+    expect(partText).toContain("#cgptperf-code=");
+    expect(partText).not.toContain("const line_0");
+  });
+
+  test("compactOversizedTurns bounds an abnormally huge active turn while preserving semantics", () => {
+    const messages: ConversationMessage[] = [
+      {
+        id: "user-giant",
+        author: { role: "user" },
+        content: { content_type: "text", parts: ["Run 60 heavy tool steps"] },
+      },
+    ];
+    for (let i = 0; i < 60; i += 1) {
+      messages.push(
+        {
+          id: `call-${i}`,
+          author: { role: "assistant" },
+          recipient: "tool.exec",
+          content: { content_type: "code", parts: ["a".repeat(8_000)] },
+        },
+        {
+          id: `out-${i}`,
+          author: { role: "tool" },
+          content: { content_type: "execution_output", parts: ["b".repeat(8_000)] },
+        },
+      );
+    }
+    messages.push({
+      id: "final-giant",
+      author: { role: "assistant" },
+      channel: "final",
+      recipient: "all",
+      content: { content_type: "text", parts: ["Final summarized answer"] },
+    });
+
+    const result = optimizePaginatedConversationPayload(
+      { current_node: "final-giant", messages },
+      {
+        recentFullTurns: 1,
+        compactOversizedTurns: true,
+        oversizedTurnMessages: 32,
+        oversizedTurnBytes: 256 * 1024,
+        maxOversizedToolPartChars: 2_048,
+      },
+    );
+
+    expect(result.stats.changed).toBeTrue();
+    expect(result.stats.oversizedTurnsCompacted).toBe(1);
+    const keptIds = result.payload.messages?.map((m) => m.id) ?? [];
+    expect(keptIds[0]).toBe("user-giant");
+    expect(keptIds.at(-1)).toBe("final-giant");
+    expect(keptIds.length).toBeLessThan(10);
+    expect(result.stats.keptBytes).toBeLessThan(result.stats.originalBytes * 0.05);
   });
 });

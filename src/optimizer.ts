@@ -98,6 +98,14 @@ export interface PaginatedOptimizationOptions {
   forceKeepMessageIds: Iterable<string>;
   /** Completed paginated turns should render as one semantic user/assistant pair. */
   collapseTurnsToQuestionAnswer: boolean;
+  /** Apply lightweight compaction to abnormally large single turns. */
+  compactOversizedTurns?: boolean;
+  /** Byte threshold above which a single turn triggers oversized compaction. */
+  oversizedTurnBytes?: number;
+  /** Message count threshold above which a single turn triggers oversized compaction. */
+  oversizedTurnMessages?: number;
+  /** Maximum characters retained in a single surviving internal tool/code part in an oversized turn. */
+  maxOversizedToolPartChars?: number;
 }
 
 export interface PaginatedOptimizationStats {
@@ -110,6 +118,14 @@ export interface PaginatedOptimizationStats {
   userTurns: number;
   recentFullTurns: number;
   removedByKind: Record<string, number>;
+  oversizedTurnsCompacted?: number;
+}
+
+export interface StaticCodeBlock {
+  token: string;
+  language: string;
+  code: string;
+  lineCount: number;
 }
 
 export interface PaginatedOptimizationResult<
@@ -638,6 +654,90 @@ export function optimizePaginatedConversationPayload<
     }
   }
 
+  let oversizedTurnsCompacted = 0;
+  let contentCompacted = false;
+  if (options.compactOversizedTurns === true && kept.length > 0) {
+    const maxTurnBytes = Math.max(16 * 1024, Math.floor(options.oversizedTurnBytes ?? 96 * 1024));
+    const maxTurnMessages = Math.max(4, Math.floor(options.oversizedTurnMessages ?? 24));
+    const maxToolPartChars = Math.max(1_024, Math.floor(options.maxOversizedToolPartChars ?? 16 * 1024));
+
+    const turns: ConversationMessage[][] = [];
+    let currentTurn: ConversationMessage[] = [];
+    for (const message of kept) {
+      if (message.author?.role === "user" && currentTurn.length > 0) {
+        turns.push(currentTurn);
+        currentTurn = [];
+      }
+      currentTurn.push(message);
+    }
+    if (currentTurn.length > 0) turns.push(currentTurn);
+
+    const compactedMessages: ConversationMessage[] = [];
+    for (const turn of turns) {
+      const turnBytes = turn.reduce((sum, msg) => sum + serializedBytes(msg), 0);
+      if (turn.length <= maxTurnMessages && turnBytes <= maxTurnBytes) {
+        compactedMessages.push(...turn);
+        continue;
+      }
+
+      oversizedTurnsCompacted += 1;
+      // Preserve semantic turn integrity: keep user question(s), system/developer
+      // messages, forced dependency ids, the latest/final visible assistant answer,
+      // and at most the last 2 live tool/internal messages.
+      const visibleAssistants = turn.filter(
+        (msg) => msg.author?.role === "assistant" && shouldKeepHistoricMessage(msg),
+      );
+      const primaryAssistant =
+        [...visibleAssistants].reverse().find((msg) => msg.channel === "final") ??
+        visibleAssistants.at(-1);
+      const internalMessages = turn.filter((msg) => !shouldKeepHistoricMessage(msg));
+      const recentInternalKeep = new Set<ConversationMessage>(internalMessages.slice(-2));
+
+      for (const msg of turn) {
+        const role = msg.author?.role;
+        const isForced = typeof msg.id === "string" && forcedIds.has(msg.id);
+        const keepInOversized =
+          role === "user" ||
+          (role != null && ALWAYS_KEEP_ROLES.has(role)) ||
+          isForced ||
+          msg === primaryAssistant ||
+          (shouldKeepHistoricMessage(msg) && visibleAssistants.length <= 2) ||
+          recentInternalKeep.has(msg);
+
+        if (!keepInOversized) {
+          const kind = messageKind(msg);
+          removedByKind[kind] = (removedByKind[kind] ?? 0) + 1;
+          continue;
+        }
+
+        // Lighten oversized internal/tool payloads while leaving visible user/assistant text intact.
+        if (!shouldKeepHistoricMessage(msg) && Array.isArray(msg.content?.parts)) {
+          let partChanged = false;
+          const lightParts = (msg.content.parts as unknown[]).map((part) => {
+            if (typeof part === "string" && part.length > maxToolPartChars) {
+              partChanged = true;
+              return `${part.slice(0, maxToolPartChars)}\n...[truncated ${part.length - maxToolPartChars} chars]`;
+            }
+            return part;
+          });
+          if (partChanged) {
+            contentCompacted = true;
+            compactedMessages.push({
+              ...msg,
+              content: {
+                ...msg.content,
+                parts: lightParts,
+              },
+            });
+            continue;
+          }
+        }
+        compactedMessages.push(msg);
+      }
+    }
+    kept = compactedMessages;
+  }
+
   // Native pagination requires an oldest message id after every successful page.
   // Complete turn pages should always retain user/final messages, but keep the
   // newest original message as a conservative bridge if an unusual page does not.
@@ -670,7 +770,7 @@ export function optimizePaginatedConversationPayload<
     (sum, message) => sum + serializedBytes(message),
     0,
   );
-  const changed = kept.length !== messages.length;
+  const changed = kept.length !== messages.length || contentCompacted;
 
   return {
     payload: (changed
@@ -692,6 +792,7 @@ export function optimizePaginatedConversationPayload<
       userTurns,
       recentFullTurns,
       removedByKind,
+      ...(oversizedTurnsCompacted > 0 ? { oversizedTurnsCompacted } : {}),
     },
   };
 }
@@ -946,4 +1047,138 @@ export function clampPaginatedNumTurns(
 
 export function isLegacyFullConversationUrl(rawUrl: string, baseUrl: string): boolean {
   return matchConversationApiUrl(rawUrl, baseUrl)?.kind === "legacy-full";
+}
+
+/**
+ * Compute a safe Markdown code fence strictly longer than the longest contiguous
+ * run of backticks in `code` (minimum 3 backticks).
+ */
+export function computeMarkdownCodeFence(code: string): string {
+  let maxRun = 0;
+  let currentRun = 0;
+  for (let i = 0; i < code.length; i += 1) {
+    if (code.charCodeAt(i) === 96 /* ` */) {
+      currentRun += 1;
+      if (currentRun > maxRun) maxRun = currentRun;
+    } else {
+      currentRun = 0;
+    }
+  }
+  return "`".repeat(Math.max(3, maxRun + 1));
+}
+
+export function extractFencedCodeBlocks(
+  text: string,
+  tokenPrefix: string,
+  sessionPrefix: string,
+  nextId: () => number,
+  options?: { minBlocks?: number; minTotalChars?: number },
+): { text: string; blocks: StaticCodeBlock[] } {
+  const lines = text.split("\n");
+  const candidates: Array<{
+    start: number;
+    end: number;
+    language: string;
+    code: string;
+  }> = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const open = lines[index].match(/^\s*(`{3,}|~{3,})\s*([^`]*)$/);
+    if (!open) continue;
+    const fence = open[1];
+    const fenceChar = fence[0];
+    const closePattern = new RegExp(`^\\s*${fenceChar}{${fence.length},}\\s*$`);
+    let close = index + 1;
+    while (close < lines.length && !closePattern.test(lines[close])) close += 1;
+    if (close >= lines.length) continue;
+    const language = open[2].trim().split(/\s+/, 1)[0] ?? "";
+    const code = lines.slice(index + 1, close).join("\n");
+    candidates.push({ start: index, end: close, language, code });
+    index = close;
+  }
+
+  const minBlocks = options?.minBlocks ?? 4;
+  const minTotalChars = options?.minTotalChars ?? 8_000;
+  const totalCodeChars = candidates.reduce((sum, block) => sum + block.code.length, 0);
+  if (candidates.length === 0 || (candidates.length < minBlocks && totalCodeChars < minTotalChars)) {
+    return { text, blocks: [] };
+  }
+
+  const byStart = new Map(candidates.map((block) => [block.start, block]));
+  const output: string[] = [];
+  const blocks: StaticCodeBlock[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const block = byStart.get(index);
+    if (!block) {
+      output.push(lines[index]);
+      continue;
+    }
+    const token = `${sessionPrefix}-${tokenPrefix}-${nextId()}`;
+    const lineCount = Math.max(1, block.code.split("\n").length);
+    blocks.push({
+      token,
+      language: block.language,
+      code: block.code,
+      lineCount,
+    });
+    output.push(
+      `[代码块](https://chatgpt.com/#cgptperf-code=${token}&lines=${lineCount})`,
+    );
+    index = block.end;
+  }
+  return { text: output.join("\n"), blocks };
+}
+
+export function lightenPaginatedCodeBlocks(
+  payload: PaginatedConversationPayload,
+  sessionPrefix: string,
+  nextId: () => number,
+  oversizedTurnThresholdChars = 32_000,
+): { payload: PaginatedConversationPayload; codeBlocks: StaticCodeBlock[] } {
+  if (!Array.isArray(payload.messages)) return { payload, codeBlocks: [] };
+  const codeBlocks: StaticCodeBlock[] = [];
+
+  const messages = payload.messages.map((message, messageIndex) => {
+    if (
+      !["assistant", "user"].includes(String(message.author?.role)) ||
+      !Array.isArray(message.content?.parts)
+    ) {
+      return message;
+    }
+    const messageChars = message.content.parts.reduce<number>(
+      (acc, p) => acc + (typeof p === "string" ? p.length : 0),
+      0,
+    );
+    const isOversizedMessage = messageChars >= oversizedTurnThresholdChars;
+    let changed = false;
+    const parts = message.content.parts.map((part, partIndex) => {
+      if (typeof part !== "string") return part;
+      const isGiantPart = isOversizedMessage || part.length >= 24_000;
+      const result = extractFencedCodeBlocks(
+        part,
+        `m${messageIndex}p${partIndex}`,
+        sessionPrefix,
+        nextId,
+        isGiantPart
+          ? { minBlocks: 1, minTotalChars: 2_048 }
+          : { minBlocks: 4, minTotalChars: 8_000 },
+      );
+      if (result.blocks.length === 0) return part;
+      changed = true;
+      codeBlocks.push(...result.blocks);
+      return result.text;
+    });
+    if (!changed) return message;
+    return {
+      ...message,
+      content: {
+        ...message.content,
+        parts,
+      },
+    };
+  });
+  return {
+    payload: { ...payload, messages },
+    codeBlocks,
+  };
 }

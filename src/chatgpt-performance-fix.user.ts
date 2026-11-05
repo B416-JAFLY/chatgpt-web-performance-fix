@@ -1,7 +1,9 @@
 import {
   clampPaginatedNumTurns,
+  computeMarkdownCodeFence,
   convertNativeInitialToLazyConversation,
   DEFAULT_OPTIMIZER_OPTIONS,
+  lightenPaginatedCodeBlocks,
   matchConversationApiUrl,
   optimizeConversationPayload,
   optimizePaginatedConversationPayload,
@@ -11,9 +13,11 @@ import {
   type PaginatedConversationPayload,
   type OptimizationStats,
   type PaginatedOptimizationStats,
+  type StaticCodeBlock,
 } from "./optimizer";
 import { CacheBudget } from "./cache-budget";
 import { waitForHistoryConsent } from "./modern-history";
+import { DatasetStatBatcher, PerfTelemetry } from "./perf-metrics";
 import { ScopedContainerObserver, deduplicateAddedNodes } from "./scoped-observer";
 
 declare const unsafeWindow: (Window & typeof globalThis) | undefined;
@@ -32,13 +36,6 @@ interface StoredSettings {
   initialTurns: TurnLoadSetting;
   /** Visible user turns loaded by one manual history action. */
   historyBatchTurns: TurnLoadSetting;
-}
-
-interface StaticCodeBlock {
-  token: string;
-  language: string;
-  code: string;
-  lineCount: number;
 }
 
 interface MaterializedResponse {
@@ -76,8 +73,55 @@ const MAX_INITIAL_CONVERSATION_SNAPSHOTS = 32;
 const RESPONSE_CACHE_BUDGET_BYTES = 16 * 1024 * 1024;
 const MAX_CONFIGURED_TURNS = 500;
 const ALL_INITIAL_FIRST_PAGE_TURNS = 32;
+const WORKER_TASK_TIMEOUT_MS = 8_000;
+const MAX_WORKER_PENDING_TASKS = 16;
 const INTERNAL_RESPONSE_READS = new WeakSet<Response>();
 const sharedMemoryBudget = new CacheBudget(RESPONSE_CACHE_BUDGET_BYTES);
+const telemetryByWindow = new WeakMap<Window & typeof globalThis, PerfTelemetry>();
+const batcherByWindow = new WeakMap<Window & typeof globalThis, DatasetStatBatcher>();
+const nativeIoByWindow = new WeakMap<
+  Window & typeof globalThis,
+  typeof IntersectionObserver | null
+>();
+
+function getPerfTelemetry(pageWindow: Window & typeof globalThis): PerfTelemetry {
+  let instance = telemetryByWindow.get(pageWindow);
+  if (!instance) {
+    instance = new PerfTelemetry(pageWindow, 100);
+    telemetryByWindow.set(pageWindow, instance);
+    try {
+      Reflect.set(pageWindow, "__chatgptPerfMetrics", instance);
+    } catch {
+      // Ignore locked global object in hardened environments.
+    }
+  }
+  return instance;
+}
+
+function getDatasetBatcher(
+  pageWindow: Window & typeof globalThis,
+): DatasetStatBatcher {
+  let instance = batcherByWindow.get(pageWindow);
+  if (!instance) {
+    instance = new DatasetStatBatcher(pageWindow);
+    batcherByWindow.set(pageWindow, instance);
+  }
+  return instance;
+}
+
+function getNativeIntersectionObserver(
+  pageWindow: Window & typeof globalThis,
+): typeof IntersectionObserver | null {
+  if (nativeIoByWindow.has(pageWindow)) {
+    return nativeIoByWindow.get(pageWindow) ?? null;
+  }
+  const ctor =
+    typeof pageWindow.IntersectionObserver === "function"
+      ? pageWindow.IntersectionObserver
+      : null;
+  nativeIoByWindow.set(pageWindow, ctor);
+  return ctor;
+}
 
 function findConversationScrollContainer(
   pageWindow: Window & typeof globalThis,
@@ -463,19 +507,16 @@ function yieldUntilInteractionIdle(
     settled = true;
     if (fallbackTimer != null) pageWindow.clearTimeout(fallbackTimer);
     if (forced) {
-      const root = pageWindow.document.documentElement;
-      root.dataset.chatgptHistoryIdleForced = String(
-        Number(root.dataset.chatgptHistoryIdleForced ?? "0") + 1,
-      );
+      const batcher = getDatasetBatcher(pageWindow);
+      batcher.increment("chatgptHistoryIdleForced");
+      batcher.flushNow();
     }
-    try {
-      pageWindow.performance.measure("chatgpt-perf:history-idle-wait", {
-        start: startedAt,
-        end: pageWindow.performance.now(),
-      });
-    } catch {
-      // Ignore unavailable User Timing options.
-    }
+    getPerfTelemetry(pageWindow).recordDuration(
+      "history-idle-wait",
+      startedAt,
+      pageWindow.performance.now(),
+      "chatgpt-perf:history-idle-wait",
+    );
     resolve?.();
   };
   return new Promise((resolve) => {
@@ -522,22 +563,26 @@ interface JsonWorkerReply {
   error?: string;
 }
 
+interface WorkerPendingTask {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  startedAt: number;
+  operation: string;
+  timer: number;
+  conversationId: string | null;
+}
+
 let jsonWorkerState:
   | {
       worker: Worker;
       nextId: number;
-      pending: Map<
-        number,
-        {
-          resolve: (value: unknown) => void;
-          reject: (error: Error) => void;
-          startedAt: number;
-          operation: string;
-        }
-      >;
+      pending: Map<number, WorkerPendingTask>;
     }
   | null
   | undefined;
+
+let fallbackStaticCodeSession = Math.random().toString(36).slice(2);
+let nextFallbackStaticCodeId = 1;
 
 function ensureJsonWorker(
   pageWindow: Window & typeof globalThis,
@@ -548,7 +593,7 @@ function ensureJsonWorker(
     return null;
   }
   try {
-    const source = __CHATGPT_OPTIMIZER_WORKER_SOURCE__;;
+    const source = __CHATGPT_OPTIMIZER_WORKER_SOURCE__;
     const url = pageWindow.URL.createObjectURL(
       new pageWindow.Blob([source], { type: "application/javascript" }),
     );
@@ -559,45 +604,37 @@ function ensureJsonWorker(
     const state = {
       worker,
       nextId: 1,
-      pending: new Map<
-        number,
-        {
-          resolve: (value: unknown) => void;
-          reject: (error: Error) => void;
-          startedAt: number;
-          operation: string;
-        }
-      >(),
+      pending: new Map<number, WorkerPendingTask>(),
     };
     worker.addEventListener("message", (event: MessageEvent<JsonWorkerReply>) => {
       const reply = event.data;
       const pending = state.pending.get(reply.id);
       if (!pending) return;
       state.pending.delete(reply.id);
+      pageWindow.clearTimeout(pending.timer);
       const finishedAt = pageWindow.performance.now();
-      const elapsed = finishedAt - pending.startedAt;
-      try {
-        pageWindow.performance.measure(
-          `chatgpt-perf:worker:${pending.operation}`,
-          {
-            start: pending.startedAt,
-            end: finishedAt,
-            detail: { durationMs: elapsed },
-          },
-        );
-      } catch {
-        // Older browsers may not support PerformanceMeasureOptions.
-      }
-      const root = pageWindow.document.documentElement;
-      const count = Number(root.dataset.chatgptJsonWorkerParses ?? "0");
-      const total = Number(root.dataset.chatgptJsonWorkerTotalMs ?? "0");
-      root.dataset.chatgptJsonWorkerParses = String(count + 1);
-      root.dataset.chatgptJsonWorkerTotalMs = String(Math.round(total + elapsed));
+      const telemetry = getPerfTelemetry(pageWindow);
+      const elapsed = telemetry.recordDuration(
+        "worker",
+        pending.startedAt,
+        finishedAt,
+        `chatgpt-perf:worker:${pending.operation}`,
+      );
+      telemetry.recordDuration(
+        `worker:${pending.operation}`,
+        pending.startedAt,
+        finishedAt,
+      );
+      const batcher = getDatasetBatcher(pageWindow);
+      batcher.increment("chatgptJsonWorkerParses");
+      batcher.addFloat("chatgptJsonWorkerTotalMs", elapsed, true);
+      batcher.flushNow();
       if (reply.ok) pending.resolve(reply.value);
       else pending.reject(new Error(reply.error ?? "Worker JSON parse failed"));
     });
     worker.addEventListener("error", () => {
       for (const pending of state.pending.values()) {
+        pageWindow.clearTimeout(pending.timer);
         pending.reject(new Error("JSON worker failed"));
       }
       state.pending.clear();
@@ -613,22 +650,105 @@ function ensureJsonWorker(
   }
 }
 
+function cancelWorkerTasksForConversation(
+  pageWindow: Window & typeof globalThis,
+  conversationId?: string | null,
+): void {
+  const state = jsonWorkerState;
+  if (!state) return;
+  let cancelledCount = 0;
+  for (const [id, pending] of [...state.pending.entries()]) {
+    if (
+      pending.operation === "cancel-paginated-job" ||
+      pending.operation === "cancel-conversation-jobs"
+    ) {
+      continue;
+    }
+    if (!conversationId || pending.conversationId === conversationId) {
+      state.pending.delete(id);
+      pageWindow.clearTimeout(pending.timer);
+      pending.reject(new Error("Worker task cancelled due to conversation change"));
+      cancelledCount += 1;
+    }
+  }
+  if (cancelledCount > 0) {
+    getDatasetBatcher(pageWindow).increment(
+      "chatgptWorkerTasksCancelled",
+      cancelledCount,
+    );
+  }
+  try {
+    const cancelId = state.nextId++;
+    state.worker.postMessage({
+      id: cancelId,
+      operation: "cancel-conversation-jobs",
+      ...(conversationId ? { conversationId } : {}),
+    });
+  } catch {
+    // Worker may already be terminated.
+  }
+}
+
 async function runOptimizerWorker<T>(
   pageWindow: Window & typeof globalThis,
-  request: Record<string, unknown> & { text?: string; buffer?: ArrayBuffer },
+  request: Record<string, unknown> & {
+    text?: string;
+    buffer?: ArrayBuffer;
+    conversationId?: string;
+    timeoutMs?: number;
+  },
   transfer: Transferable[] = [],
 ): Promise<T> {
   const state = ensureJsonWorker(pageWindow);
   if (!state) throw new Error("Optimizer worker is unavailable");
+  const operation = String(request.operation ?? "unknown");
+  const isCancelOp =
+    operation === "cancel-paginated-job" ||
+    operation === "cancel-conversation-jobs";
+  if (!isCancelOp && state.pending.size >= MAX_WORKER_PENDING_TASKS) {
+    getDatasetBatcher(pageWindow).increment("chatgptWorkerQueueRejected");
+    throw new Error("Optimizer worker queue is full");
+  }
   const id = state.nextId++;
+  const timeoutMs =
+    typeof request.timeoutMs === "number" && request.timeoutMs > 0
+      ? request.timeoutMs
+      : WORKER_TASK_TIMEOUT_MS;
+  const conversationId =
+    typeof request.conversationId === "string"
+      ? request.conversationId
+      : currentConversationId(pageWindow);
+
   return await new Promise<T>((resolve, reject) => {
+    const timer = pageWindow.setTimeout(() => {
+      const pending = state.pending.get(id);
+      if (!pending) return;
+      state.pending.delete(id);
+      getDatasetBatcher(pageWindow).increment("chatgptWorkerTaskTimeouts");
+      if (typeof request.token === "string") {
+        try {
+          state.worker.postMessage({
+            id: state.nextId++,
+            operation: "cancel-paginated-job",
+            token: request.token,
+          });
+        } catch {
+          // Ignore worker postMessage errors on timeout cleanup.
+        }
+      }
+      reject(new Error(`Worker task timed out after ${timeoutMs}ms: ${operation}`));
+    }, timeoutMs);
+
     state.pending.set(id, {
       resolve: resolve as (value: unknown) => void,
       reject,
       startedAt: pageWindow.performance.now(),
-      operation: String(request.operation ?? "unknown"),
+      operation,
+      timer,
+      conversationId,
     });
-    state.worker.postMessage({ id, ...request }, transfer);
+    const { timeoutMs: _timeoutMs, ...workerPayload } = request;
+    state.worker.postMessage({ id, ...workerPayload, conversationId }, transfer);
   });
 }
 
@@ -698,16 +818,25 @@ async function optimizePaginatedOffMain(
       forceKeepMessageIds: initial ? requiredInitialMessageIds(payload) : [],
       collapseTurnsToQuestionAnswer:
         apiKind === "paginated-messages" || (initial && !active),
+      compactOversizedTurns: true,
     });
+    const lightened = !active
+      ? lightenPaginatedCodeBlocks(
+          result.payload,
+          fallbackStaticCodeSession,
+          () => nextFallbackStaticCodeId++,
+        )
+      : { payload: result.payload, codeBlocks: [] as StaticCodeBlock[] };
     return {
-      payload: result.payload,
+      payload: lightened.payload,
       stats: result.stats,
-      chunks: splitPaginatedMessagesNewestFirst(result.payload.messages ?? [], {
+      chunks: splitPaginatedMessagesNewestFirst(lightened.payload.messages ?? [], {
         maxTurns: renderTurns,
         maxMessages: Number.MAX_SAFE_INTEGER,
         maxBytes: Number.MAX_SAFE_INTEGER,
         allowSplitTurns: false,
       }),
+      codeBlocks: lightened.codeBlocks,
       active,
       cacheable: initial && isIdlePaginatedConversation(payload),
     };
@@ -719,6 +848,8 @@ interface PaginatedJobProbe {
   complete: boolean;
   cursor: string | null;
   messageCount: number;
+  approxBytes?: number;
+  memoryLimitReached?: boolean;
 }
 
 interface PreparedPaginatedResponse {
@@ -730,6 +861,7 @@ async function startPaginatedWorkerJob(
   pageWindow: Window & typeof globalThis,
   buffer: ArrayBuffer,
   requireFinal: boolean,
+  conversationId?: string,
 ): Promise<PaginatedJobProbe> {
   return runOptimizerWorker<PaginatedJobProbe>(
     pageWindow,
@@ -737,6 +869,7 @@ async function startPaginatedWorkerJob(
       operation: "start-paginated-job",
       buffer,
       requireFinal,
+      ...(conversationId ? { conversationId } : {}),
     },
     [buffer],
   );
@@ -746,6 +879,7 @@ async function prependPaginatedWorkerJob(
   pageWindow: Window & typeof globalThis,
   token: string,
   buffer: ArrayBuffer,
+  conversationId?: string,
 ): Promise<PaginatedJobProbe> {
   return runOptimizerWorker<PaginatedJobProbe>(
     pageWindow,
@@ -753,6 +887,7 @@ async function prependPaginatedWorkerJob(
       operation: "prepend-paginated-job",
       token,
       buffer,
+      ...(conversationId ? { conversationId } : {}),
     },
     [buffer],
   );
@@ -764,6 +899,7 @@ async function finishPaginatedWorkerJob(
   apiKind: "paginated-initial" | "paginated-messages",
   mode: Exclude<Mode, "off">,
   renderTurns = MODE_OPTIONS[mode].paginatedRenderTurns,
+  conversationId?: string,
 ): Promise<PaginatedWorkerResult> {
   return runOptimizerWorker<PaginatedWorkerResult>(pageWindow, {
     operation: "finish-paginated-job",
@@ -771,6 +907,7 @@ async function finishPaginatedWorkerJob(
     apiKind,
     recentFullTurns: MODE_OPTIONS[mode].recentFullTurns,
     lightweightCodeBlocks: true,
+    ...(conversationId ? { conversationId } : {}),
     chunkOptions: {
       maxTurns: renderTurns,
       maxMessages: Number.MAX_SAFE_INTEGER,
@@ -788,6 +925,7 @@ async function cancelPaginatedWorkerJob(
     await runOptimizerWorker(pageWindow, {
       operation: "cancel-paginated-job",
       token,
+      timeoutMs: 1_500,
     });
   } catch {
     // The worker may already have failed/terminated.
@@ -801,18 +939,10 @@ async function parseJsonOffMain<T>(
   // Small payloads are faster locally; large conversation pages must not block
   // the same main thread that owns the sidebar and all input handling.
   if (text.length < 128 * 1024) return JSON.parse(text) as T;
-  const state = ensureJsonWorker(pageWindow);
-  if (!state) return JSON.parse(text) as T;
-  const id = state.nextId++;
   try {
-    return await new Promise<T>((resolve, reject) => {
-      state.pending.set(id, {
-        resolve: resolve as (value: unknown) => void,
-        reject,
-        startedAt: pageWindow.performance.now(),
-        operation: "parse",
-      });
-      state.worker.postMessage({ id, operation: "parse", text });
+    return await runOptimizerWorker<T>(pageWindow, {
+      operation: "parse",
+      text,
     });
   } catch (error) {
     console.warn(`[${SCRIPT_NAME}] Worker parse fell back to main thread`, error);
@@ -920,8 +1050,9 @@ function installManualPaginationObserver(
   const marker = "__chatgptPerformanceFixIntersectionObserver";
   if (Reflect.get(pageWindow, marker)) return;
 
-  const NativeIntersectionObserver = pageWindow.IntersectionObserver;
+  const NativeIntersectionObserver = getNativeIntersectionObserver(pageWindow);
   if (typeof NativeIntersectionObserver !== "function") return;
+  const datasetBatcher = getDatasetBatcher(pageWindow);
 
   const HISTORY_SETTLED_EVENT = "chatgpt-performance-fix:history-page-settled";
   const HISTORY_FINITE_PLAN_EVENT =
@@ -932,6 +1063,10 @@ function installManualPaginationObserver(
     const testId = target.getAttribute("data-testid");
     return typeof testId === "string" && testId.includes(PAGINATION_SENTINEL_TEST_ID);
   };
+  const shouldWatchPaginationAttribute = (target: Element): boolean => {
+    if (isPaginationSentinelElement(target)) return true;
+    return target.tagName === "DIV" && !target.hasAttribute("data-testid");
+  };
   const mutationNodeContainsPaginationUi = (node: Node): boolean => {
     if (!(node instanceof pageWindow.Element)) return false;
     if (
@@ -940,6 +1075,7 @@ function installManualPaginationObserver(
     ) {
       return true;
     }
+    if (node.childElementCount === 0) return false;
     return Boolean(
       node.querySelector(
         `[data-testid*="${PAGINATION_SENTINEL_TEST_ID}"],` +
@@ -954,6 +1090,7 @@ function installManualPaginationObserver(
     driveHistoryBatchPage(): boolean;
     refreshHistoryBatchUi(): void;
     historyBatchGeneration(): number;
+    needsDomReconcile(): boolean;
   }
   const paginationDrivers = new Set<HistoryPaginationDriver>();
   const paginationReconcilers = new Set<() => void>();
@@ -1233,6 +1370,13 @@ function installManualPaginationObserver(
       return this.paginationGeneration;
     }
 
+    needsDomReconcile(): boolean {
+      const target = this.paginationTarget;
+      if (!target || !target.isConnected) return true;
+      if (!this.control || !this.control.isConnected) return true;
+      return this.control.previousElementSibling !== target;
+    }
+
     canContinueHistoryBatch(): boolean {
       return Boolean(
         this.paginationTarget?.isConnected &&
@@ -1480,6 +1624,9 @@ function installManualPaginationObserver(
     }
 
     private resetPaginationTargetObserver(newTarget?: Element): void {
+      if (newTarget && !shouldWatchPaginationAttribute(newTarget)) {
+        return;
+      }
       this.paginationTargetObserver ??= new pageWindow.MutationObserver((records) => {
         for (const record of records) {
           const target = record.target;
@@ -1505,6 +1652,7 @@ function installManualPaginationObserver(
       // shared observer with many ordinary targets.
       this.paginationTargetObserver.disconnect();
       for (const target of this.observedTargets) {
+        if (!shouldWatchPaginationAttribute(target)) continue;
         this.paginationTargetObserver.observe(target, {
           attributes: true,
           attributeFilter: ["data-testid"],
@@ -1521,25 +1669,30 @@ function installManualPaginationObserver(
 
     private noteSuppressedPagination(count: number, kind: "callback" | "record"): void {
       if (count <= 0) return;
-      const root = pageWindow.document.documentElement;
       const key = kind === "callback"
         ? "chatgptSuppressedAutoPaginationCallbacks"
         : "chatgptSuppressedAutoPaginationRecords";
-      root.dataset[key] = String(Number(root.dataset[key] ?? "0") + count);
+      datasetBatcher.increment(key, count);
+      datasetBatcher.flushNow();
     }
 
     private dispatchNative(entries: IntersectionObserverEntry[]): void {
-      for (const entry of entries) {
+      let hasPagination = false;
+      for (let i = 0; i < entries.length; i += 1) {
+        const entry = entries[i];
         if (isPaginationSentinelElement(entry.target)) {
           this.registerPaginationTarget(entry.target, false);
+          hasPagination = true;
+        } else if (this.paginationTargets.has(entry.target)) {
+          hasPagination = true;
         }
       }
-      const paginationEntries = entries.filter((entry) => this.isPaginationEntry(entry));
-      if (paginationEntries.length === 0) {
+      if (!hasPagination) {
         this.callback(entries, this);
         return;
       }
 
+      const paginationEntries = entries.filter((entry) => this.isPaginationEntry(entry));
       this.lastPaginationEntries = paginationEntries;
       this.refreshHistoryBatchUi();
       if (batchState.active) scheduleNextBatchStep();
@@ -1587,18 +1740,16 @@ function installManualPaginationObserver(
           attributeObserver.disconnect();
           this.deferredCodeMirrorTargets.delete(target);
           observer.observe(target);
-          const root = pageWindow.document.documentElement;
-          const count = Number(root.dataset.chatgptCodeMirrorIoResumed ?? "0");
-          root.dataset.chatgptCodeMirrorIoResumed = String(count + 1);
+          datasetBatcher.increment("chatgptCodeMirrorIoResumed");
+          datasetBatcher.flushNow();
         });
         attributeObserver.observe(container, {
           attributes: true,
           attributeFilter: ["data-chatgpt-rich-editor-state"],
         });
         this.deferredCodeMirrorTargets.set(target, attributeObserver);
-        const root = pageWindow.document.documentElement;
-        const count = Number(root.dataset.chatgptCodeMirrorIoDeferred ?? "0");
-        root.dataset.chatgptCodeMirrorIoDeferred = String(count + 1);
+        datasetBatcher.increment("chatgptCodeMirrorIoDeferred");
+        datasetBatcher.flushNow();
         return;
       }
       observer.observe(target);
@@ -1707,6 +1858,13 @@ function installManualPaginationObserver(
     pageWindow.addEventListener(HISTORY_SETTLED_EVENT, onHistorySettled);
     pageWindow.addEventListener(HISTORY_FINITE_PLAN_EVENT, onFiniteHistoryPlan);
     const paginationDomObserver = new pageWindow.MutationObserver((records) => {
+      if (paginationDrivers.size === 0) return;
+      for (const driver of paginationDrivers) {
+        if (driver.needsDomReconcile()) {
+          schedulePaginationDomReconcile();
+          return;
+        }
+      }
       const relevant = records.some((record) => {
         if (record.type === "attributes") {
           return isPaginationSentinelElement(record.target);
@@ -2093,6 +2251,12 @@ function installDeliveryVerifier(
 } {
   let sequence = 0;
   let hideTimer: number | undefined;
+  let observerWatchdogTimer: number | undefined;
+  let observing = false;
+  let reconcileFrame: number | null = null;
+  let reconcileTimer: number | undefined;
+  const telemetry = getPerfTelemetry(pageWindow);
+  const datasetBatcher = getDatasetBatcher(pageWindow);
   const normalize = (text: string) => text.replace(/\s+/g, " ").trim();
   type DeliveryStage = "sending" | "verifying" | "sent" | "saved" | "failed";
   interface DeliveryVisualState {
@@ -2101,8 +2265,17 @@ function installDeliveryVerifier(
     label: string;
     title: string;
     copy: boolean;
+    cachedMessageEl?: HTMLElement | null;
   }
   let visualState: DeliveryVisualState | null = null;
+
+  const USER_MESSAGE_SELECTOR =
+    '[data-message-author-role="user"], [data-turn="user"], .group\\/user-message, [data-chatgpt-search-unit-key*=":user"]';
+  const ASSISTANT_MESSAGE_SELECTOR =
+    '[data-turn="assistant"], .agent-turn, [data-message-author-role="assistant"], [data-chatgpt-selection-message-id], [data-chatgpt-search-unit-key*=":assistant"]';
+  const RECENT_USER_CANDIDATE_LIMIT = 12;
+  const RECENT_USER_TURN_SCAN_LIMIT = 6;
+  const RECENT_ASSISTANT_SCAN_LIMIT = 6;
 
   const ensureStyles = () => {
     const id = "chatgpt-delivery-status-style";
@@ -2150,48 +2323,85 @@ function installDeliveryVerifier(
       : value.replace(/["\\]/g, "\\$&");
   };
 
-  const findMessageElement = (probe: OutgoingMessageProbe): HTMLElement | null => {
+  const findMessageElement = (
+    probe: OutgoingMessageProbe,
+    state?: DeliveryVisualState | null,
+  ): HTMLElement | null => {
+    if (state?.cachedMessageEl?.isConnected) {
+      return state.cachedMessageEl;
+    }
+    const searchRoot =
+      findConversationScrollContainer(pageWindow) ?? pageWindow.document;
+
     if (probe.messageId) {
-      const byDirectId = pageWindow.document.querySelector<HTMLElement>(
-        `[data-message-id="${escapeSelectorValue(probe.messageId)}"]`,
-      );
+      const escapedId = escapeSelectorValue(probe.messageId);
+      const byDirectId =
+        searchRoot.querySelector<HTMLElement>(`[data-message-id="${escapedId}"]`) ??
+        pageWindow.document.querySelector<HTMLElement>(
+          `[data-message-id="${escapedId}"]`,
+        );
       if (byDirectId) {
-        return (
+        const resolved =
           byDirectId.closest<HTMLElement>(
             '[data-message-author-role="user"], [data-turn="user"], .group\\/user-message',
-          ) ?? byDirectId
-        );
+          ) ?? byDirectId;
+        if (state) state.cachedMessageEl = resolved;
+        return resolved;
       }
-      const allWithSearchIds = pageWindow.document.querySelectorAll<HTMLElement>(
-        "[data-chatgpt-search-message-ids]",
+      const bySearchAttr = searchRoot.querySelectorAll<HTMLElement>(
+        `[data-chatgpt-search-message-ids*="${escapedId}"]`,
       );
-      for (const el of allWithSearchIds) {
-        const ids = el.getAttribute("data-chatgpt-search-message-ids")?.split(/[\s,]+/) ?? [];
-        if (ids.includes(probe.messageId)) return el;
+      for (let i = bySearchAttr.length - 1; i >= 0; i -= 1) {
+        const el = bySearchAttr[i];
+        const ids =
+          el.getAttribute("data-chatgpt-search-message-ids")?.split(/[\s,]+/) ?? [];
+        if (ids.includes(probe.messageId)) {
+          if (state) state.cachedMessageEl = el;
+          return el;
+        }
       }
     }
-    const candidates = [
-      ...pageWindow.document.querySelectorAll<HTMLElement>(
-        '[data-message-author-role="user"], [data-turn="user"], .group\\/user-message, [data-chatgpt-search-unit-key*=":user"]',
-      ),
-    ];
-    const userMessages = candidates.filter(
-      (el) => !candidates.some((other) => other !== el && other.contains(el)),
+
+    const allCandidates = searchRoot.querySelectorAll<HTMLElement>(
+      USER_MESSAGE_SELECTOR,
     );
-    if (probe.messageId) {
-      const exact = userMessages.find((el) => {
-        if (el.getAttribute("data-message-id") === probe.messageId) return true;
-        const ids = el.getAttribute("data-chatgpt-search-message-ids")?.split(/[\s,]+/) ?? [];
-        return ids.includes(probe.messageId!);
-      });
-      if (exact) return exact;
+    if (allCandidates.length === 0) return null;
+
+    // Slice only the tail candidates and deduplicate nested wrappers in O(k)
+    // using closest() rather than an O(n²) all-pairs contains() filter.
+    const startIndex = Math.max(0, allCandidates.length - RECENT_USER_CANDIDATE_LIMIT);
+    const recentUserMessages: HTMLElement[] = [];
+    for (let i = allCandidates.length - 1; i >= startIndex; i -= 1) {
+      const el = allCandidates[i];
+      if (el.parentElement?.closest(USER_MESSAGE_SELECTOR)) continue;
+      recentUserMessages.push(el);
+      if (recentUserMessages.length >= RECENT_USER_TURN_SCAN_LIMIT) break;
     }
+
+    if (probe.messageId) {
+      for (const el of recentUserMessages) {
+        if (el.getAttribute("data-message-id") === probe.messageId) {
+          if (state) state.cachedMessageEl = el;
+          return el;
+        }
+        const ids =
+          el.getAttribute("data-chatgpt-search-message-ids")?.split(/[\s,]+/) ?? [];
+        if (ids.includes(probe.messageId)) {
+          if (state) state.cachedMessageEl = el;
+          return el;
+        }
+      }
+    }
+
     if (!probe.text) return null;
     const expected = normalize(probe.text);
     if (!expected) return null;
-    for (let index = userMessages.length - 1; index >= 0; index -= 1) {
-      const text = normalize(userMessages[index].textContent ?? "");
-      if (text === expected || text.includes(expected)) return userMessages[index];
+    for (const el of recentUserMessages) {
+      const text = normalize(el.textContent ?? "");
+      if (text === expected || text.includes(expected)) {
+        if (state) state.cachedMessageEl = el;
+        return el;
+      }
     }
     return null;
   };
@@ -2204,11 +2414,11 @@ function installDeliveryVerifier(
     );
   };
 
-  const renderVisualState = () => {
+  const renderVisualState = (): boolean => {
     const state = visualState;
-    if (!state) return;
-    const message = findMessageElement(state.probe);
-    if (!message) return;
+    if (!state) return false;
+    const message = findMessageElement(state.probe, state);
+    if (!message) return false;
     ensureStyles();
     let host = message.querySelector<HTMLElement>(
       '[data-chatgpt-delivery-status="true"]',
@@ -2224,7 +2434,7 @@ function installDeliveryVerifier(
       host.dataset.chatgptDeliveryStage === state.stage &&
       host.dataset.chatgptDeliveryLabel === state.label
     ) {
-      return;
+      return true;
     }
     host.dataset.chatgptDeliveryStage = state.stage;
     host.dataset.chatgptDeliveryLabel = state.label;
@@ -2252,44 +2462,36 @@ function installDeliveryVerifier(
       });
       host.append(button);
     }
+    return true;
   };
 
-  const setVisualState = (
+  const hasAssistantResponseAfter = (
     probe: OutgoingMessageProbe,
-    stage: DeliveryStage,
-    label: string,
-    title: string,
-    copy = false,
-    autoHideMs = 0,
-  ) => {
-    if (hideTimer != null) {
-      pageWindow.clearTimeout(hideTimer);
-      hideTimer = undefined;
-    }
-    visualState = { probe, stage, label, title, copy };
-    renderVisualState();
-    if (autoHideMs > 0) {
-      const expectedMessageId = probe.messageId;
-      hideTimer = pageWindow.setTimeout(() => {
-        const current = visualState;
-        if (!current || current.probe.messageId !== expectedMessageId) return;
-        const message = findMessageElement(current.probe);
-        message
-          ?.querySelector<HTMLElement>('[data-chatgpt-delivery-status="true"]')
-          ?.remove();
-        visualState = null;
-      }, autoHideMs);
-    }
-  };
-
-  const hasAssistantResponseAfter = (probe: OutgoingMessageProbe): boolean => {
-    const message = findMessageElement(probe);
+    state?: DeliveryVisualState | null,
+  ): boolean => {
+    const message = findMessageElement(probe, state);
     if (!message) return false;
     const anchor = turnContainerFor(message);
-    const assistants = pageWindow.document.querySelectorAll<HTMLElement>(
-      '[data-turn="assistant"], .agent-turn, [data-message-author-role="assistant"], [data-chatgpt-selection-message-id], [data-chatgpt-search-unit-key*=":assistant"]',
+
+    // Fast path: check immediate following turn siblings in O(1).
+    let sibling = anchor.nextElementSibling;
+    for (let step = 0; sibling && step < 4; step += 1, sibling = sibling.nextElementSibling) {
+      if (
+        sibling.matches(ASSISTANT_MESSAGE_SELECTOR) ||
+        sibling.querySelector(ASSISTANT_MESSAGE_SELECTOR)
+      ) {
+        return true;
+      }
+    }
+
+    const searchRoot =
+      findConversationScrollContainer(pageWindow) ?? pageWindow.document;
+    const assistants = searchRoot.querySelectorAll<HTMLElement>(
+      ASSISTANT_MESSAGE_SELECTOR,
     );
-    for (const assistant of assistants) {
+    const startIndex = Math.max(0, assistants.length - RECENT_ASSISTANT_SCAN_LIMIT);
+    for (let i = assistants.length - 1; i >= startIndex; i -= 1) {
+      const assistant = assistants[i];
       if (anchor.contains(assistant)) continue;
       if (
         (anchor.compareDocumentPosition(assistant) &
@@ -2301,16 +2503,117 @@ function installDeliveryVerifier(
     return false;
   };
 
+  const stopObserving = () => {
+    if (reconcileFrame != null && typeof pageWindow.cancelAnimationFrame === "function") {
+      pageWindow.cancelAnimationFrame(reconcileFrame);
+      reconcileFrame = null;
+    }
+    if (reconcileTimer != null) {
+      pageWindow.clearTimeout(reconcileTimer);
+      reconcileTimer = undefined;
+    }
+    if (observerWatchdogTimer != null) {
+      pageWindow.clearTimeout(observerWatchdogTimer);
+      observerWatchdogTimer = undefined;
+    }
+    if (observing) {
+      domObserver.disconnect();
+      observing = false;
+    }
+    pageWindow.document.documentElement.dataset.chatgptDeliveryObserverActive = "false";
+  };
+
+  const armObserverWatchdog = (timeoutMs: number) => {
+    if (observerWatchdogTimer != null) {
+      pageWindow.clearTimeout(observerWatchdogTimer);
+    }
+    observerWatchdogTimer = pageWindow.setTimeout(() => {
+      observerWatchdogTimer = undefined;
+      stopObserving();
+    }, timeoutMs);
+  };
+
+  const startObserving = (watchdogMs = 45_000) => {
+    const observeTarget =
+      findConversationScrollContainer(pageWindow) ??
+      pageWindow.document.body ??
+      pageWindow.document.documentElement;
+    if (!observeTarget) return;
+    if (!observing) {
+      domObserver.observe(observeTarget, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: [
+          "data-turn",
+          "data-message-id",
+          "data-message-author-role",
+          "data-chatgpt-search-message-ids",
+          "data-chatgpt-search-unit-key",
+        ],
+      });
+      observing = true;
+      pageWindow.document.documentElement.dataset.chatgptDeliveryObserverActive = "true";
+    }
+    armObserverWatchdog(watchdogMs);
+  };
+
+  const setVisualState = (
+    probe: OutgoingMessageProbe,
+    stage: DeliveryStage,
+    label: string,
+    title: string,
+    copy = false,
+    autoHideMs = 0,
+  ): boolean => {
+    if (hideTimer != null) {
+      pageWindow.clearTimeout(hideTimer);
+      hideTimer = undefined;
+    }
+    const previousCached =
+      visualState &&
+      visualState.probe.messageId != null &&
+      visualState.probe.messageId === probe.messageId
+        ? visualState.cachedMessageEl
+        : undefined;
+    visualState = {
+      probe,
+      stage,
+      label,
+      title,
+      copy,
+      cachedMessageEl: previousCached,
+    };
+    const mounted = renderVisualState();
+    if (autoHideMs > 0) {
+      const expectedMessageId = probe.messageId;
+      hideTimer = pageWindow.setTimeout(() => {
+        const current = visualState;
+        if (!current || current.probe.messageId !== expectedMessageId) return;
+        const message = findMessageElement(current.probe, current);
+        message
+          ?.querySelector<HTMLElement>('[data-chatgpt-delivery-status="true"]')
+          ?.remove();
+        visualState = null;
+        stopObserving();
+      }, autoHideMs);
+    }
+    return mounted;
+  };
+
   const confirmFromAssistantResponse = (
     probe: OutgoingMessageProbe,
     token: number,
   ): boolean => {
-    if (token !== sequence || !hasAssistantResponseAfter(probe)) return false;
+    if (token !== sequence || !hasAssistantResponseAfter(probe, visualState)) {
+      return false;
+    }
     const root = pageWindow.document.documentElement;
     root.dataset.chatgptLastSendVerified = "true";
+    let mounted = false;
     if (root.dataset.chatgptLastSendEvidence !== "assistant-turn") {
       root.dataset.chatgptLastSendEvidence = "assistant-turn";
-      setVisualState(
+      mounted = setVisualState(
         probe,
         "sent",
         "已发送",
@@ -2318,36 +2621,73 @@ function installDeliveryVerifier(
         false,
         2_500,
       );
+    } else {
+      mounted = renderVisualState();
+    }
+    if (mounted) {
+      // Delivery is fully verified and the badge is rendered; pause the
+      // MutationObserver immediately so streaming output does not trigger it.
+      stopObserving();
     }
     return true;
   };
 
-  const domObserver = new pageWindow.MutationObserver(() => {
-    renderVisualState();
-    const state = visualState;
-    if (
-      state &&
-      (state.stage === "sending" ||
-        state.stage === "verifying" ||
-        state.stage === "sent")
-    ) {
-      confirmFromAssistantResponse(state.probe, sequence);
+  const runDeliveryReconcile = () => {
+    reconcileFrame = null;
+    if (reconcileTimer != null) {
+      pageWindow.clearTimeout(reconcileTimer);
+      reconcileTimer = undefined;
     }
+    const startedAt = pageWindow.performance.now();
+    try {
+      const state = visualState;
+      if (!state) {
+        stopObserving();
+        return;
+      }
+      const mounted = renderVisualState();
+      if (
+        state.stage === "sending" ||
+        state.stage === "verifying" ||
+        state.stage === "sent"
+      ) {
+        const confirmed = confirmFromAssistantResponse(state.probe, sequence);
+        if (confirmed && mounted) {
+          stopObserving();
+        }
+      } else if (state.stage === "failed" && mounted) {
+        stopObserving();
+      }
+    } finally {
+      const finishedAt = pageWindow.performance.now();
+      telemetry.recordDuration(
+        "delivery-observer",
+        startedAt,
+        finishedAt,
+        "chatgpt-perf:delivery-observer",
+      );
+      datasetBatcher.increment("chatgptDeliveryObserverFrames");
+      datasetBatcher.flushNow();
+    }
+  };
+
+  const scheduleDeliveryReconcile = () => {
+    datasetBatcher.increment("chatgptDeliveryObserverCallbacks");
+    if (reconcileFrame != null || reconcileTimer != null) return;
+    if (
+      pageWindow.document.visibilityState === "hidden" ||
+      typeof pageWindow.requestAnimationFrame !== "function"
+    ) {
+      reconcileTimer = pageWindow.setTimeout(runDeliveryReconcile, 16);
+      return;
+    }
+    reconcileFrame = pageWindow.requestAnimationFrame(runDeliveryReconcile);
+  };
+
+  const domObserver = new pageWindow.MutationObserver(() => {
+    scheduleDeliveryReconcile();
   });
-  const observeTarget = pageWindow.document.body ?? pageWindow.document.documentElement;
-  if (observeTarget) {
-    domObserver.observe(observeTarget, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: [
-        "data-turn",
-        "data-message-author-role",
-        "data-chatgpt-search-message-ids",
-        "data-chatgpt-search-unit-key",
-      ],
-    });
-  }
+  pageWindow.document.documentElement.dataset.chatgptDeliveryObserverActive = "false";
 
   return {
     begin: (probe) => {
@@ -2359,6 +2699,7 @@ function installDeliveryVerifier(
       root.dataset.chatgptDeliveryTrackedSends = String(
         Number(root.dataset.chatgptDeliveryTrackedSends ?? "0") + 1,
       );
+      startObserving(45_000);
       setVisualState(probe, "sending", "发送中", "正在发送消息");
     },
     accepted: (probe) => {
@@ -2367,7 +2708,7 @@ function installDeliveryVerifier(
       const root = pageWindow.document.documentElement;
       root.dataset.chatgptLastSendVerified = "true";
       root.dataset.chatgptLastSendEvidence = "http-accepted";
-      setVisualState(
+      const mounted = setVisualState(
         probe,
         "sent",
         "已发送",
@@ -2375,19 +2716,27 @@ function installDeliveryVerifier(
         false,
         2_500,
       );
-      confirmFromAssistantResponse(probe, token);
+      const confirmed = confirmFromAssistantResponse(probe, token);
+      if (!confirmed || !mounted) {
+        startObserving(10_000);
+      }
     },
     failed: (probe, message) => {
       if (!probe.hasUserMessage) return;
       sequence += 1;
       pageWindow.document.documentElement.dataset.chatgptLastSendVerified = "false";
-      setVisualState(
+      const mounted = setVisualState(
         probe,
         "failed",
         "发送失败",
         `发送失败：${message}`,
         Boolean(probe.text),
       );
+      if (mounted) {
+        stopObserving();
+      } else {
+        startObserving(5_000);
+      }
     },
   };
 }
@@ -2411,39 +2760,266 @@ html[data-chatgpt-performance-fix="large"] [data-message-id] {
   mount?.append(style);
 }
 
+const MAX_HOT_STATIC_CODE_BLOCKS = 1_024;
+const STATIC_CODE_WARM_MARGIN_PX = 1_200;
+const STATIC_CODE_UNLOAD_DISTANCE_PX = 2_400;
+const STATIC_CODE_LARGE_CHAR_THRESHOLD = 2_048;
+const STATIC_CODE_LARGE_LINE_THRESHOLD = 40;
+const STATIC_CODE_IDLE_TIMEOUT_MS = 120;
+const STATIC_CODE_MAX_WAIT_MS = 180;
 
-const staticCodeBlocks = new Map<string, StaticCodeBlock>();
-const staticCodeHydrated = new WeakSet<Element>();
-const staticCodeFillQueue: Array<{
+interface StaticCodeController {
+  token: string;
   block: StaticCodeBlock;
   container: HTMLElement;
   code: HTMLElement;
   copy: HTMLButtonElement;
-}> = [];
+  collapsedHeight: number;
+  enqueuedAt: number;
+  queued: boolean;
+}
+
+const staticCodeBlocks = new Map<string, StaticCodeBlock>();
+const activeConversationCodeFallback = new Map<string, StaticCodeBlock>();
+const staticCodeElementBlocks = new WeakMap<HTMLElement, StaticCodeBlock>();
+const staticCodeControllers = new WeakMap<HTMLElement, StaticCodeController>();
+const connectedStaticCodeContainers = new Set<HTMLElement>();
+const staticCodeHydrated = new WeakSet<Element>();
+const staticCodeFillQueue: StaticCodeController[] = [];
 let staticCodeFillHandle: number | null = null;
+let staticCodeFillUsingIdleCallback = false;
 let staticCodeHydratorInstalled = false;
+let staticCodeViewportObserver: IntersectionObserver | null = null;
+let staticCodeScrollCheckScheduled = false;
+
+function isLargeStaticCodeBlock(block: StaticCodeBlock): boolean {
+  return (
+    block.code.length >= STATIC_CODE_LARGE_CHAR_THRESHOLD ||
+    block.lineCount >= STATIC_CODE_LARGE_LINE_THRESHOLD
+  );
+}
+
+function lookupStaticCodeBlock(
+  token: string,
+  pageWindow?: Window & typeof globalThis,
+): StaticCodeBlock | undefined {
+  const hot = staticCodeBlocks.get(token);
+  if (hot) {
+    // Refresh LRU order in the hot map
+    staticCodeBlocks.delete(token);
+    staticCodeBlocks.set(token, hot);
+    return hot;
+  }
+  const fallback = activeConversationCodeFallback.get(token);
+  if (fallback) return fallback;
+  if (pageWindow?.document) {
+    const container = pageWindow.document.querySelector<HTMLElement>(
+      `[data-chatgpt-static-code="${token}"]`,
+    );
+    if (container) {
+      const bound = staticCodeElementBlocks.get(container);
+      if (bound) return bound;
+      const code = container.querySelector("code")?.textContent ?? "";
+      const language = container.dataset.chatgptStaticCodeLanguage ?? "";
+      if (code) {
+        return {
+          token,
+          code,
+          language,
+          lineCount: code.split("\n").length,
+        };
+      }
+    }
+  }
+  return undefined;
+}
+
+function fillStaticCodeNow(
+  pageWindow: Window & typeof globalThis,
+  controller: StaticCodeController,
+): void {
+  controller.queued = false;
+  if (controller.container.dataset.chatgptStaticCodeState !== "ready") {
+    controller.code.textContent = controller.block.code;
+    controller.container.dataset.chatgptStaticCodeState = "ready";
+    const batcher = getDatasetBatcher(pageWindow);
+    batcher.increment("chatgptStaticCodeHydrated");
+    batcher.flushNow();
+  }
+  controller.copy.disabled = false;
+}
+
+function unloadStaticCodeNow(
+  pageWindow: Window & typeof globalThis,
+  controller: StaticCodeController,
+): void {
+  if (controller.container.dataset.chatgptStaticCodeExpanded === "true") return;
+  if (controller.container.dataset.chatgptStaticCodeState !== "ready") return;
+  if (!isLargeStaticCodeBlock(controller.block)) return;
+  const measuredHeight = Math.round(
+    controller.container.getBoundingClientRect().height || controller.collapsedHeight,
+  );
+  controller.container.style.height = `${Math.max(92, measuredHeight)}px`;
+  controller.code.textContent = "";
+  controller.container.dataset.chatgptStaticCodeState = "cold";
+  const batcher = getDatasetBatcher(pageWindow);
+  batcher.increment("chatgptStaticCodeUnloaded");
+  batcher.flushNow();
+}
+
+function enqueueStaticCodeFill(
+  pageWindow: Window & typeof globalThis,
+  controller: StaticCodeController,
+): void {
+  if (controller.container.dataset.chatgptStaticCodeState === "ready") return;
+  if (controller.queued) return;
+  controller.queued = true;
+  controller.enqueuedAt = pageWindow.performance.now();
+  controller.container.dataset.chatgptStaticCodeState = "loading";
+  staticCodeFillQueue.push(controller);
+  scheduleStaticCodeFill(pageWindow);
+}
 
 function scheduleStaticCodeFill(pageWindow: Window & typeof globalThis): void {
-  if (staticCodeFillHandle != null) return;
+  if (staticCodeFillHandle != null || staticCodeFillQueue.length === 0) return;
   const drain = (deadline?: IdleDeadline) => {
     staticCodeFillHandle = null;
+    staticCodeFillUsingIdleCallback = false;
+    const now = pageWindow.performance.now();
     let filled = 0;
-    while (staticCodeFillQueue.length > 0 && filled < 2) {
-      if (deadline && deadline.timeRemaining() < 8) break;
+    while (staticCodeFillQueue.length > 0 && filled < 3) {
+      const head = staticCodeFillQueue[0];
+      if (!head.container.isConnected || !head.queued) {
+        head.queued = false;
+        staticCodeFillQueue.shift();
+        continue;
+      }
+      const waitMs = Math.max(0, now - head.enqueuedAt);
+      const expired =
+        deadline?.didTimeout === true || waitMs >= STATIC_CODE_MAX_WAIT_MS;
+      if (deadline && !expired && deadline.timeRemaining() < 8 && filled > 0) {
+        break;
+      }
+      if (deadline && !expired && deadline.timeRemaining() < 8 && filled === 0) {
+        // Still allow waiting for a real idle slot until STATIC_CODE_MAX_WAIT_MS.
+        break;
+      }
       const item = staticCodeFillQueue.shift()!;
+      item.queued = false;
       if (!item.container.isConnected) continue;
-      item.code.textContent = item.block.code;
-      item.copy.disabled = false;
-      item.container.dataset.chatgptStaticCodeState = "ready";
+      const rect = item.container.getBoundingClientRect();
+      const viewportHeight = pageWindow.innerHeight || 900;
+      const inWarmRange =
+        rect.bottom >= -STATIC_CODE_WARM_MARGIN_PX &&
+        rect.top <= viewportHeight + STATIC_CODE_WARM_MARGIN_PX;
+      const isExpanded = item.container.dataset.chatgptStaticCodeExpanded === "true";
+      if (!inWarmRange && !isExpanded) {
+        item.container.dataset.chatgptStaticCodeState = "cold";
+        continue;
+      }
+      fillStaticCodeNow(pageWindow, item);
       filled += 1;
     }
     if (staticCodeFillQueue.length > 0) scheduleStaticCodeFill(pageWindow);
   };
   if (typeof pageWindow.requestIdleCallback === "function") {
-    staticCodeFillHandle = pageWindow.requestIdleCallback(drain);
+    staticCodeFillUsingIdleCallback = true;
+    staticCodeFillHandle = pageWindow.requestIdleCallback(drain, {
+      timeout: STATIC_CODE_IDLE_TIMEOUT_MS,
+    });
   } else {
+    staticCodeFillUsingIdleCallback = false;
     staticCodeFillHandle = pageWindow.requestAnimationFrame(() => drain());
   }
+}
+
+function evaluateStaticCodeViewport(pageWindow: Window & typeof globalThis): void {
+  staticCodeScrollCheckScheduled = false;
+  const viewportHeight = pageWindow.innerHeight || 900;
+  for (const container of [...connectedStaticCodeContainers]) {
+    if (!container.isConnected) {
+      connectedStaticCodeContainers.delete(container);
+      staticCodeViewportObserver?.unobserve(container);
+      continue;
+    }
+    const controller = staticCodeControllers.get(container);
+    if (!controller) continue;
+    const rect = container.getBoundingClientRect();
+    const isVisible = rect.bottom >= 0 && rect.top <= viewportHeight;
+    if (isVisible) {
+      fillStaticCodeNow(pageWindow, controller);
+      continue;
+    }
+    const inWarmRange =
+      rect.bottom >= -STATIC_CODE_WARM_MARGIN_PX &&
+      rect.top <= viewportHeight + STATIC_CODE_WARM_MARGIN_PX;
+    if (inWarmRange) {
+      enqueueStaticCodeFill(pageWindow, controller);
+      continue;
+    }
+    const farAway =
+      rect.bottom < -STATIC_CODE_UNLOAD_DISTANCE_PX ||
+      rect.top > viewportHeight + STATIC_CODE_UNLOAD_DISTANCE_PX;
+    if (farAway) {
+      unloadStaticCodeNow(pageWindow, controller);
+    }
+  }
+}
+
+function scheduleStaticCodeViewportCheck(
+  pageWindow: Window & typeof globalThis,
+): void {
+  if (staticCodeScrollCheckScheduled) return;
+  staticCodeScrollCheckScheduled = true;
+  if (typeof pageWindow.requestAnimationFrame === "function") {
+    pageWindow.requestAnimationFrame(() => evaluateStaticCodeViewport(pageWindow));
+  } else {
+    pageWindow.setTimeout(() => evaluateStaticCodeViewport(pageWindow), 16);
+  }
+}
+
+function ensureStaticCodeViewportObserver(
+  pageWindow: Window & typeof globalThis,
+): IntersectionObserver | null {
+  if (staticCodeViewportObserver) return staticCodeViewportObserver;
+  const NativeIO = getNativeIntersectionObserver(pageWindow);
+  if (typeof NativeIO !== "function") return null;
+  staticCodeViewportObserver = new NativeIO(
+    (entries) => {
+      const viewportHeight = pageWindow.innerHeight || 900;
+      for (const entry of entries) {
+        const container = entry.target as HTMLElement;
+        if (!container.isConnected) {
+          connectedStaticCodeContainers.delete(container);
+          staticCodeViewportObserver?.unobserve(container);
+          continue;
+        }
+        const controller = staticCodeControllers.get(container);
+        if (!controller) continue;
+        const rect = entry.boundingClientRect;
+        if (entry.isIntersecting) {
+          const isVisible = rect.bottom >= 0 && rect.top <= viewportHeight;
+          if (isVisible) {
+            fillStaticCodeNow(pageWindow, controller);
+          } else {
+            enqueueStaticCodeFill(pageWindow, controller);
+          }
+        } else {
+          const farAway =
+            rect.bottom < -STATIC_CODE_UNLOAD_DISTANCE_PX ||
+            rect.top > viewportHeight + STATIC_CODE_UNLOAD_DISTANCE_PX;
+          if (farAway) {
+            unloadStaticCodeNow(pageWindow, controller);
+          }
+        }
+      }
+    },
+    {
+      root: null,
+      rootMargin: `${STATIC_CODE_WARM_MARGIN_PX}px 0px`,
+    },
+  );
+  return staticCodeViewportObserver;
 }
 
 function staticCodeToken(anchor: HTMLAnchorElement): string | null {
@@ -2466,24 +3042,9 @@ function restoreStaticCodeMarkdown(
 ): string {
   if (!text.includes("#cgptperf-code=")) return text;
   return text.replace(STATIC_CODE_MARKER_RE, (full, token: string) => {
-    let block = staticCodeBlocks.get(token);
-    if (!block && pageWindow?.document) {
-      const container = pageWindow.document.querySelector<HTMLElement>(
-        `[data-chatgpt-static-code="${token}"]`,
-      );
-      if (container) {
-        const code = container.querySelector("code")?.textContent ?? "";
-        const language = container.dataset.chatgptStaticCodeLanguage ?? "";
-        block = {
-          token,
-          code,
-          language,
-          lineCount: code ? code.split("\n").length : 1,
-        };
-      }
-    }
+    const block = lookupStaticCodeBlock(token, pageWindow);
     if (!block) return full;
-    const fence = block.code.includes("```") ? "````" : "```";
+    const fence = computeMarkdownCodeFence(block.code);
     const language = block.language ? block.language : "";
     return `${fence}${language}\n${block.code}\n${fence}`;
   });
@@ -2527,7 +3088,7 @@ function hydrateStaticCodeAnchor(
 ): void {
   if (staticCodeHydrated.has(anchor)) return;
   const token = staticCodeToken(anchor);
-  const block = token ? staticCodeBlocks.get(token) : undefined;
+  const block = token ? lookupStaticCodeBlock(token, pageWindow) : undefined;
   if (!token || !block) return;
   staticCodeHydrated.add(anchor);
 
@@ -2536,7 +3097,7 @@ function hydrateStaticCodeAnchor(
   const container = pageWindow.document.createElement("div");
   container.dataset.chatgptStaticCode = token;
   container.dataset.chatgptStaticCodeLanguage = block.language || "";
-  container.dataset.chatgptStaticCodeState = "loading";
+  container.dataset.chatgptStaticCodeState = "cold";
   container.style.height = `${collapsedHeight}px`;
 
   const header = pageWindow.document.createElement("div");
@@ -2546,23 +3107,51 @@ function hydrateStaticCodeAnchor(
   const actions = pageWindow.document.createElement("span");
   actions.dataset.chatgptStaticCodeActions = "true";
 
+  const pre = pageWindow.document.createElement("pre");
+  const code = pageWindow.document.createElement("code");
+  code.textContent = "";
+  pre.append(code);
+
+  const copy = pageWindow.document.createElement("button");
+  copy.type = "button";
+  copy.dataset.chatgptStaticCodeCopy = "true";
+  copy.textContent = "复制";
+  copy.disabled = false;
+
+  const controller: StaticCodeController = {
+    token,
+    block,
+    container,
+    code,
+    copy,
+    collapsedHeight,
+    enqueuedAt: 0,
+    queued: false,
+  };
+  staticCodeElementBlocks.set(container, block);
+  staticCodeControllers.set(container, controller);
+
   const expand = pageWindow.document.createElement("button");
   expand.type = "button";
+  expand.dataset.chatgptStaticCodeToggle = "true";
   expand.textContent = "展开";
   expand.addEventListener("click", () => {
     const expanded = container.dataset.chatgptStaticCodeExpanded === "true";
+    if (!expanded) {
+      // Immediately populate code when user expands a cold/queued block.
+      fillStaticCodeNow(pageWindow, controller);
+    }
     container.dataset.chatgptStaticCodeExpanded = expanded ? "false" : "true";
     container.style.height = expanded ? `${collapsedHeight}px` : "auto";
     expand.textContent = expanded ? "展开" : "收起";
   });
 
-  const copy = pageWindow.document.createElement("button");
-  copy.type = "button";
-  copy.textContent = "复制";
-  copy.disabled = true;
   copy.addEventListener("click", async () => {
     try {
-      const codeToCopy = code.textContent || staticCodeBlocks.get(token)?.code || block.code;
+      const codeToCopy =
+        code.textContent ||
+        lookupStaticCodeBlock(token, pageWindow)?.code ||
+        block.code;
       await pageWindow.navigator.clipboard.writeText(codeToCopy);
       copy.textContent = "已复制";
       pageWindow.setTimeout(() => (copy.textContent = "复制"), 1_200);
@@ -2573,11 +3162,6 @@ function hydrateStaticCodeAnchor(
   });
   actions.append(expand, copy);
   header.append(label, actions);
-
-  const pre = pageWindow.document.createElement("pre");
-  const code = pageWindow.document.createElement("code");
-  code.textContent = "";
-  pre.append(code);
   container.append(header, pre);
 
   const replaceTarget =
@@ -2585,15 +3169,24 @@ function hydrateStaticCodeAnchor(
       ? anchor.parentElement
       : anchor;
   replaceTarget.replaceWith(container);
+  connectedStaticCodeContainers.add(container);
+
+  const observer = ensureStaticCodeViewportObserver(pageWindow);
+  observer?.observe(container);
 
   const rect = container.getBoundingClientRect();
-  if (rect.bottom >= 0 && rect.top <= pageWindow.innerHeight) {
-    code.textContent = block.code;
-    copy.disabled = false;
-    container.dataset.chatgptStaticCodeState = "ready";
+  const viewportHeight = pageWindow.innerHeight || 900;
+  if (rect.bottom >= 0 && rect.top <= viewportHeight) {
+    fillStaticCodeNow(pageWindow, controller);
+  } else if (
+    rect.bottom >= -STATIC_CODE_WARM_MARGIN_PX &&
+    rect.top <= viewportHeight + STATIC_CODE_WARM_MARGIN_PX
+  ) {
+    enqueueStaticCodeFill(pageWindow, controller);
   } else {
-    staticCodeFillQueue.push({ block, container, code, copy });
-    scheduleStaticCodeFill(pageWindow);
+    const batcher = getDatasetBatcher(pageWindow);
+    batcher.increment("chatgptStaticCodeDeferredCold");
+    batcher.flushNow();
   }
 }
 
@@ -2630,7 +3223,19 @@ function installStaticCodeHydrator(
   staticCodeHydratorInstalled = true;
   const root = pageWindow.document.documentElement;
   if (!root) return;
+  ensureStaticCodeViewportObserver(pageWindow);
   scanStaticCodeMarkers(pageWindow, root);
+
+  pageWindow.addEventListener(
+    "scroll",
+    () => scheduleStaticCodeViewportCheck(pageWindow),
+    { capture: true, passive: true },
+  );
+  pageWindow.addEventListener(
+    "resize",
+    () => scheduleStaticCodeViewportCheck(pageWindow),
+    { passive: true },
+  );
 
   // Global listener for textarea focus to restore any pasted/edited code markers outside the container
   pageWindow.document.addEventListener(
@@ -2646,6 +3251,20 @@ function installStaticCodeHydrator(
   const scopedObserver = new ScopedContainerObserver(
     pageWindow,
     (records) => {
+      for (const record of records) {
+        for (let i = 0; i < record.removedNodes.length; i += 1) {
+          const removed = record.removedNodes[i];
+          if (!(removed instanceof pageWindow.Element) || removed.isConnected) continue;
+          const containers = [
+            ...(removed.hasAttribute("data-chatgpt-static-code") ? [removed as HTMLElement] : []),
+            ...removed.querySelectorAll<HTMLElement>("[data-chatgpt-static-code]"),
+          ];
+          for (const el of containers) {
+            connectedStaticCodeContainers.delete(el);
+            staticCodeViewportObserver?.unobserve(el);
+          }
+        }
+      }
       const addedElements = deduplicateAddedNodes(records);
       for (const el of addedElements) {
         scanStaticCodeMarkers(pageWindow, el);
@@ -2667,19 +3286,33 @@ function registerStaticCodeBlocks(
 ): void {
   if (!blocks?.length) return;
   const convId = currentConversationId(pageWindow) ?? "global";
+  const batcher = getDatasetBatcher(pageWindow);
   for (const block of blocks) {
+    staticCodeBlocks.delete(block.token);
     staticCodeBlocks.set(block.token, block);
     const codeBytes = 2 * (block.code.length + (block.language?.length ?? 0)) + 128;
     sharedMemoryBudget.set(`staticCode:${convId}:${block.token}`, codeBytes, () => {
       staticCodeBlocks.delete(block.token);
     });
   }
-  while (staticCodeBlocks.size > 2_048) {
+  while (staticCodeBlocks.size > MAX_HOT_STATIC_CODE_BLOCKS) {
     const oldest = staticCodeBlocks.keys().next().value;
     if (typeof oldest !== "string") break;
+    const evictedBlock = staticCodeBlocks.get(oldest);
+    if (evictedBlock) {
+      activeConversationCodeFallback.set(oldest, evictedBlock);
+    }
     staticCodeBlocks.delete(oldest);
     sharedMemoryBudget.delete(`staticCode:${convId}:${oldest}`);
+    batcher.increment("chatgptStaticCodeEvictedCount");
   }
+  while (activeConversationCodeFallback.size > 8_192) {
+    const oldestFallback = activeConversationCodeFallback.keys().next().value;
+    if (typeof oldestFallback !== "string") break;
+    activeConversationCodeFallback.delete(oldestFallback);
+  }
+  batcher.set("chatgptStaticCodeHotCount", String(staticCodeBlocks.size));
+  batcher.flushNow();
   installStaticCodeHydrator(pageWindow);
   scanStaticCodeMarkers(pageWindow, pageWindow.document.documentElement);
 }
@@ -2693,7 +3326,23 @@ function installRichTextPerformanceFix(
   if (Reflect.get(pageWindow, marker)) return;
   Reflect.set(pageWindow, marker, true);
 
+  const telemetry = getPerfTelemetry(pageWindow);
+  const datasetBatcher = getDatasetBatcher(pageWindow);
   const smoothedMarkdownSourceHints = new Set<string>(["/2afb55f3-"]);
+  let learnedRuntimeAssetHint = false;
+  let visibilityHookCalls = 0;
+  let visibilityStackProbes = 0;
+  let visibilityBypassMatches = 0;
+  let consecutiveUnmatchedProbes = 0;
+  let probeSuspendedUntilDomHint = false;
+  let visibilityHookTotalMs = 0;
+  let cachedMicrotaskDecision: DocumentVisibilityState | null = null;
+  let microtaskResetScheduled = false;
+
+  const clearMicrotaskDecision = () => {
+    microtaskResetScheduled = false;
+    cachedMicrotaskDecision = null;
+  };
 
   // SmoothedMarkdown uses document.visibilityState only to decide whether to synthesize its
   // 16ms character-by-character markdown reparse loop. Return "hidden" only to
@@ -2719,16 +3368,101 @@ function installRichTextPerformanceFix(
         configurable: true,
         enumerable: visibilityDescriptor.enumerable ?? true,
         get() {
+          visibilityHookCalls += 1;
+          datasetBatcher.set(
+            "chatgptVisibilityHookCalls",
+            String(visibilityHookCalls),
+          );
           const actual = nativeVisibilityGet.call(this) as DocumentVisibilityState;
-          if (this === pageWindow.document && actual !== "hidden") {
-            const stack = new Error().stack ?? "";
-            if (
-              [...smoothedMarkdownSourceHints].some((hint) => stack.includes(hint))
-            ) {
-              pageWindow.document.documentElement.dataset.chatgptSmoothedMarkdownBypass =
-                "enabled";
-              return "hidden";
+          if (
+            this !== pageWindow.document ||
+            actual === "hidden" ||
+            probeSuspendedUntilDomHint
+          ) {
+            return actual;
+          }
+          if (cachedMicrotaskDecision != null) {
+            return cachedMicrotaskDecision;
+          }
+
+          const startedAt = pageWindow.performance.now();
+          let stack = "";
+          const ErrorCtor = Error as ErrorConstructor & { stackTraceLimit?: number };
+          const prevLimit = ErrorCtor.stackTraceLimit;
+          try {
+            if (typeof prevLimit === "number") {
+              ErrorCtor.stackTraceLimit = 6;
             }
+            stack = new Error().stack ?? "";
+          } finally {
+            if (typeof prevLimit === "number") {
+              ErrorCtor.stackTraceLimit = prevLimit;
+            }
+          }
+
+          visibilityStackProbes += 1;
+          let matched = false;
+          for (const hint of smoothedMarkdownSourceHints) {
+            if (stack.includes(hint)) {
+              matched = true;
+              break;
+            }
+          }
+
+          const finishedAt = pageWindow.performance.now();
+          const elapsed = telemetry.recordDuration(
+            "visibility-hook",
+            startedAt,
+            finishedAt,
+            "chatgpt-perf:visibility-hook",
+          );
+          visibilityHookTotalMs += elapsed;
+          datasetBatcher.set(
+            "chatgptVisibilityStackProbes",
+            String(visibilityStackProbes),
+          );
+          datasetBatcher.set(
+            "chatgptVisibilityHookTotalMs",
+            visibilityHookTotalMs.toFixed(3),
+          );
+
+          const decision: DocumentVisibilityState = matched ? "hidden" : actual;
+          cachedMicrotaskDecision = decision;
+          if (!microtaskResetScheduled) {
+            microtaskResetScheduled = true;
+            if (typeof queueMicrotask === "function") {
+              queueMicrotask(clearMicrotaskDecision);
+            } else {
+              Promise.resolve().then(clearMicrotaskDecision);
+            }
+          }
+
+          if (matched) {
+            visibilityBypassMatches += 1;
+            consecutiveUnmatchedProbes = 0;
+            datasetBatcher.set("chatgptSmoothedMarkdownBypass", "enabled");
+            datasetBatcher.flushNow();
+            return "hidden";
+          }
+
+          consecutiveUnmatchedProbes += 1;
+          // Circuit-breaker for new ChatGPT frontend bundles: if repeated stack
+          // probes never match any known hint and no SmoothedMarkdown DOM exists,
+          // suspend stack creation until a Smoothed DOM node appears.
+          if (
+            consecutiveUnmatchedProbes >= 64 &&
+            visibilityBypassMatches === 0 &&
+            !learnedRuntimeAssetHint &&
+            !pageWindow.document.querySelector(
+              '[class*="SmoothedMarkdown"], [class*="SmoothedCodeBlock"]',
+            )
+          ) {
+            probeSuspendedUntilDomHint = true;
+            datasetBatcher.set(
+              "chatgptSmoothedMarkdownBypass",
+              "fallback-suspended",
+            );
+            datasetBatcher.flushNow();
           }
           return actual;
         },
@@ -2877,21 +3611,27 @@ html [data-chatgpt-static-code-state="loading"] pre {
     observe(target: Element, options?: ResizeObserverOptions): void {
       if (isSmoothedCodeMeasurement(target)) {
         this.skipped.add(target);
-        const stack = new Error().stack ?? "";
-        for (const match of stack.matchAll(
-          /https:\/\/[^/]+\/(?:cdn\/)?assets\/([^/:]+\.js)/g,
-        )) {
-          const filename = match[1];
-          if (!filename || filename.includes("performance-fix")) continue;
-          const hint = `/${filename.split("-")[0]}-`;
-          smoothedMarkdownSourceHints.add(hint);
+        probeSuspendedUntilDomHint = false;
+        // Only capture stack once to learn the current ChatGPT bundle prefix
+        // instead of generating a stack on every SmoothedCodeBlock observation.
+        if (!learnedRuntimeAssetHint) {
+          const stack = new Error().stack ?? "";
+          for (const match of stack.matchAll(
+            /https:\/\/[^/]+\/(?:cdn\/)?assets\/([^/:]+\.js)/g,
+          )) {
+            const filename = match[1];
+            if (!filename || filename.includes("performance-fix")) continue;
+            const hint = `/${filename.split("-")[0]}-`;
+            smoothedMarkdownSourceHints.add(hint);
+            learnedRuntimeAssetHint = true;
+          }
+          datasetBatcher.set(
+            "chatgptSmoothedMarkdownSourceCount",
+            String(smoothedMarkdownSourceHints.size),
+          );
         }
-        const root = pageWindow.document.documentElement;
-        root.dataset.chatgptSmoothedMarkdownSourceCount = String(
-          smoothedMarkdownSourceHints.size,
-        );
-        const count = Number(root.dataset.chatgptRichTextSkippedResizeObservers ?? "0");
-        root.dataset.chatgptRichTextSkippedResizeObservers = String(count + 1);
+        datasetBatcher.increment("chatgptRichTextSkippedResizeObservers");
+        datasetBatcher.flushNow();
         return;
       }
 
@@ -2910,18 +3650,16 @@ html [data-chatgpt-static-code-state="loading"] pre {
           attributeObserver.disconnect();
           this.deferredCodeMirrorTargets.delete(target);
           this.native.observe(target, options);
-          const root = pageWindow.document.documentElement;
-          const count = Number(root.dataset.chatgptCodeMirrorRoResumed ?? "0");
-          root.dataset.chatgptCodeMirrorRoResumed = String(count + 1);
+          datasetBatcher.increment("chatgptCodeMirrorRoResumed");
+          datasetBatcher.flushNow();
         });
         attributeObserver.observe(container, {
           attributes: true,
           attributeFilter: ["data-chatgpt-rich-editor-state"],
         });
         this.deferredCodeMirrorTargets.set(target, attributeObserver);
-        const root = pageWindow.document.documentElement;
-        const count = Number(root.dataset.chatgptCodeMirrorRoDeferred ?? "0");
-        root.dataset.chatgptCodeMirrorRoDeferred = String(count + 1);
+        datasetBatcher.increment("chatgptCodeMirrorRoDeferred");
+        datasetBatcher.flushNow();
         return;
       }
       this.native.observe(target, options);
@@ -3014,9 +3752,8 @@ html [data-chatgpt-static-code-state="loading"] pre {
   let warmScanFrame: number | null = null;
 
   const incrementMetric = (name: string): void => {
-    const root = pageWindow.document.documentElement;
-    const current = Number(root.dataset[name] ?? "0");
-    root.dataset[name] = String(current + 1);
+    datasetBatcher.increment(name);
+    datasetBatcher.flushNow();
   };
 
   const activate = (item: RichActivation): void => {
@@ -3099,7 +3836,7 @@ html [data-chatgpt-static-code-state="loading"] pre {
   // Capture the native constructor before the pagination hook is installed.
   // The hook deliberately suppresses pagination sentinels and must not be
   // involved in observing rich-text blocks.
-  const NativeIntersectionObserver = pageWindow.IntersectionObserver;
+  const NativeIntersectionObserver = getNativeIntersectionObserver(pageWindow);
   const makeWarmObserver = (distance: number, root: Element | null): IntersectionObserver | null => {
     if (typeof NativeIntersectionObserver !== "function") return null;
     return new NativeIntersectionObserver((entries) => {
@@ -3446,10 +4183,15 @@ function installLegacyResponseFallback(
     if (INTERNAL_RESPONSE_READS.has(response) || !response.ok || response.bodyUsed) {
       return false;
     }
-    const match = matchConversationApiUrl(response.url, pageWindow.location.href);
+    const rawUrl = response.url;
+    // Fast-reject non-legacy responses without allocating a URL instance.
+    if (typeof rawUrl !== "string" || !rawUrl.includes("/backend-api/conversation/")) {
+      return false;
+    }
+    const match = matchConversationApiUrl(rawUrl, pageWindow.location.href);
     if (match?.kind !== "legacy-full") return false;
     try {
-      const url = new pageWindow.URL(response.url, pageWindow.location.href);
+      const url = new pageWindow.URL(rawUrl, pageWindow.location.href);
       return !["1", "true"].includes(
         url.searchParams.get("include_full_conversation") ?? "",
       );
@@ -3836,10 +4578,12 @@ async function prepareCompletePaginatedResponse(
       pageWindow,
       await firstResponse.clone().arrayBuffer(),
       apiKind === "paginated-messages",
+      conversationId,
     );
     const seenCursors = new Set<string>();
     for (let attempt = 0; attempt < (completeAll ? 64 : 9); attempt += 1) {
       if (!completeAll && probe.complete) break;
+      if (probe.memoryLimitReached) break;
       const cursor = probe.cursor;
       if (!cursor || seenCursors.has(cursor)) break;
       seenCursors.add(cursor);
@@ -3868,6 +4612,7 @@ async function prepareCompletePaginatedResponse(
         pageWindow,
         probe.token,
         await olderResponse.arrayBuffer(),
+        conversationId,
       );
     }
     return { response: firstResponse, workerJobToken: probe.token };
@@ -4377,16 +5122,8 @@ function install(pageWindow: Window & typeof globalThis): void {
         conversationId,
         (initialSnapshotEpochs.get(conversationId) ?? 0) + 1,
       );
-      sharedMemoryBudget.deleteMatching((key) =>
-        key.startsWith(`localPage:${conversationId}:`) ||
-        key.startsWith(`staticCode:${conversationId}:`),
-      );
     } else {
       globalInitialSnapshotEpoch += 1;
-      sharedMemoryBudget.deleteMatching((key) =>
-        key.startsWith("localPage:") ||
-        key.startsWith("byUrl:"),
-      );
     }
 
     for (const [key, snapshot] of initialSnapshots) {
@@ -4408,12 +5145,35 @@ function install(pageWindow: Window & typeof globalThis): void {
     if (currentId && currentId !== lastKnownConvId) {
       const prevId = lastKnownConvId;
       lastKnownConvId = currentId;
+      activeConversationCodeFallback.clear();
+      staticCodeFillQueue.length = 0;
+      for (const el of [...connectedStaticCodeContainers]) {
+        if (!el.isConnected) {
+          connectedStaticCodeContainers.delete(el);
+          staticCodeViewportObserver?.unobserve(el);
+        }
+      }
       if (prevId) {
+        cancelWorkerTasksForConversation(pageWindow, prevId);
+        for (const [key] of cache) {
+          if (key.includes(prevId)) {
+            cache.delete(key);
+            responseBudget.delete(`history:${key}`);
+          }
+        }
+        for (const [key, snapshot] of initialSnapshots) {
+          if (!snapshot.rateLimited && key.includes(`:${prevId}:`)) {
+            initialSnapshots.delete(key);
+            responseBudget.delete(`snapshot:${key}`);
+          }
+        }
         sharedMemoryBudget.deleteMatching((key) =>
           key.startsWith(`localPage:${prevId}:`) ||
-          key.startsWith(`staticCode:${prevId}:`),
+          key.startsWith(`staticCode:${prevId}:`) ||
+          key.startsWith("staticCode:global:"),
         );
       }
+      activeConversationCodeFallback.clear();
     }
   };
   pageWindow.addEventListener("popstate", checkConversationSwitch, { passive: true });
@@ -4532,6 +5292,15 @@ function install(pageWindow: Window & typeof globalThis): void {
     // Retry-After snapshots remain intact so a mutation cannot restart a 429
     // request loop while the server is explicitly asking the client to wait.
     invalidateInitialSnapshots(conversationId);
+    if (conversationId) {
+      sharedMemoryBudget.deleteMatching((key) =>
+        key.startsWith(`localPage:${conversationId}:`),
+      );
+    } else {
+      sharedMemoryBudget.deleteMatching((key) =>
+        key.startsWith("localPage:") || key.startsWith("byUrl:"),
+      );
+    }
     for (const key of cache.keys()) responseBudget.delete(`history:${key}`);
     cache.clear();
     if (cacheCleanupTimer != null) pageWindow.clearTimeout(cacheCleanupTimer);
