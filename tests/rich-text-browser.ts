@@ -11,12 +11,16 @@ window.IntersectionObserver=class {
  constructor(callback,options){this.callback=callback;this.options=options;this.targets=new Set();window.__observers.push(this)}
  observe(target){this.targets.add(target)} unobserve(target){this.targets.delete(target)} disconnect(){this.targets.clear()} takeRecords(){return []}
 };
-</script><script src="/script.js"></script><main><div class="thread-scroll-container" style="height:600px;overflow:auto"><div data-turn-key="fixture"><div data-markdown-text-style="default"><div style="height:30000px"></div><div id="blocks"></div><table id="modern-table"><tr><td>fixture</td></tr></table></div></div></div></main><pre id="result">PENDING</pre><script>
+</script><script src="/script.js"></script><nav><div id="sidebar-list"><div><a href="/c/33333333-3333-4333-8333-333333333333">First conversation</a></div></div></nav><main><div class="thread-scroll-container" style="height:600px;overflow:auto"><div data-turn-key="fixture"><div data-markdown-text-style="default"><div style="height:30000px"></div><div id="blocks"></div><table id="modern-table"><tr><td>fixture</td></tr></table></div></div></div></main><pre id="result">PENDING</pre><script>
 (async()=>{try {
  const wait=ms=>new Promise(r=>setTimeout(r,ms));
  const blocks=document.querySelector('#blocks');
  for(let i=0;i<80;i++){const x=document.createElement('div');x.className='katex-display';x.style.height='120px';x.textContent='formula';blocks.append(x)}
  await wait(300);
+ const sidebar=document.querySelector('#sidebar-list');
+ sidebar.append(document.createElement('div'));await wait(100);
+ if(document.querySelector('[data-chatgpt-sidebar-refresh-control], [data-chatgpt-sidebar-refresh-button], #chatgpt-sidebar-refresh-style'))throw Error('unexpected sidebar refresh control');
+ if(sidebar.firstElementChild?.querySelector('a')?.textContent!=='First conversation')throw Error('first sidebar entry changed');
  if(document.querySelectorAll('[data-chatgpt-rich-block-state=cold]').length!==81)throw Error('far blocks not cold');
  if(document.querySelector('#modern-table').getAttribute('data-chatgpt-rich-block-state')!=='cold')throw Error('modern ChatGPT table not detected');
  window.scrollTo(0,100);await wait(200);
@@ -34,8 +38,11 @@ window.IntersectionObserver=class {
  document.querySelector('#result').textContent='PASS';
  }catch(e){document.querySelector('#result').textContent='FAIL '+e.message}})();
 </script>`;
+let sidebarRequests = 0;
 const server = Bun.serve({hostname:"127.0.0.1", port:0, fetch(req) {
- return new URL(req.url).pathname === "/script.js"
+ const pathname = new URL(req.url).pathname;
+ if (pathname === "/backend-api/conversations") sidebarRequests++;
+ return pathname === "/script.js"
   ? new Response(script, {headers:{"content-type":"text/javascript; charset=utf-8"}})
   : new Response(html, {headers:{"content-type":"text/html; charset=utf-8"}});
 }});
@@ -46,5 +53,6 @@ try {
  const output = await new Response(proc.stdout).text();
  const error = await new Response(proc.stderr).text();
  if (await proc.exited !== 0 || !output.includes('<pre id="result">PASS</pre>')) throw Error(`Browser regression failed: ${output.slice(-1000)} ${error.slice(-1000)}`);
+ if (sidebarRequests !== 0) throw Error(`Unexpected sidebar requests: ${sidebarRequests}`);
  console.log("Rich-text browser regression passed");
 } finally { server.stop(true); rmSync(profile,{recursive:true,force:true}); }

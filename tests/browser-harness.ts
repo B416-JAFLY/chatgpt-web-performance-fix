@@ -321,7 +321,7 @@ function harnessHtml(): string {
 
       try {
         const normalVisibilityState = document.visibilityState;
-        const authSeedResponse = await fetch(authSeedEndpoint, {
+        await fetch(authSeedEndpoint, {
           headers: {
             authorization: harnessAuthHeader,
             "chatgpt-account-id": "harness-account",
@@ -330,9 +330,6 @@ function harnessHtml(): string {
           },
         });
         await new Promise((resolve) => setTimeout(resolve, 40));
-        const backendRequestContextCaptured =
-          authSeedResponse.ok &&
-          document.documentElement.dataset.chatgptBackendRequestContextReady === "true";
         await new Promise((resolve) => setTimeout(resolve, 200));
         const idleStatsBefore = await fetch("/stats").then((response) => response.json());
         await new Promise((resolve) => setTimeout(resolve, 2_800));
@@ -1319,26 +1316,9 @@ function harnessHtml(): string {
           metadataStatsBeforeMount.metadataInitialGets;
 
         await new Promise((resolve) => setTimeout(resolve, 80));
-        const sidebarRefreshButton = document.querySelector(
-          '[data-chatgpt-sidebar-refresh-button="true"]',
+        const sidebarRefreshRemoved = !document.querySelector(
+          '[data-chatgpt-sidebar-refresh-button="true"], [data-chatgpt-sidebar-refresh-control="true"], #chatgpt-sidebar-refresh-style',
         );
-        const sidebarRefreshButtonExists =
-          sidebarRefreshButton instanceof HTMLButtonElement;
-        const sidebarRefreshStyleInstalled = Boolean(
-          document.querySelector("#chatgpt-sidebar-refresh-style"),
-        );
-        const sidebarRefreshUsesIconAndText =
-          sidebarRefreshButton instanceof HTMLButtonElement &&
-          Boolean(sidebarRefreshButton.querySelector("[data-chatgpt-refresh-icon] svg")) &&
-          Boolean(
-            sidebarRefreshButton
-              .querySelector("[data-chatgpt-refresh-label]")
-              ?.textContent?.trim(),
-          );
-        const sidebarOnlyHasRefreshButton =
-          document.querySelectorAll(
-            '[data-chatgpt-sidebar-refresh-control="true"] button',
-          ).length === 1;
         const conversationRefreshUiRemoved =
           !document.querySelector(
             '[data-chatgpt-conversation-refresh-button="true"], [data-chatgpt-conversation-refresh-control="true"]',
@@ -1347,27 +1327,9 @@ function harnessHtml(): string {
         const conversationRefreshMenuRemoved = !(window.__gmMenuCommands ?? []).some(
           (command) => command.label === "刷新当前会话",
         );
-        const sidebarStatsBeforeManualRefresh = await fetch("/stats").then(
-          (response) => response.json(),
-        );
-        if (sidebarRefreshButton instanceof HTMLButtonElement) {
-          sidebarRefreshButton.click();
-        }
-        await new Promise((resolve) => setTimeout(resolve, 120));
-        const sidebarStatsAfterManualRefresh = await fetch("/stats").then(
-          (response) => response.json(),
-        );
-        const sidebarManualRefreshTriggered =
-          sidebarStatsAfterManualRefresh.authenticatedSidebarListProbeGets ===
-            sidebarStatsBeforeManualRefresh.authenticatedSidebarListProbeGets + 1 &&
-          sidebarStatsAfterManualRefresh.authenticatedSidebarDetailProbeGets ===
-            sidebarStatsBeforeManualRefresh.authenticatedSidebarDetailProbeGets + 1;
-        const sidebarRefreshIconPreserved = Boolean(
-          sidebarRefreshButton?.querySelector("[data-chatgpt-refresh-icon] svg"),
-        );
         const sidebarAnchor = document.querySelector("#sidebar-conversation");
-        const sidebarTitleFresh =
-          sidebarAnchor?.querySelector(".truncate")?.textContent === "fresh sidebar title";
+        const sidebarTitleUnchanged =
+          sidebarAnchor?.querySelector(".truncate")?.textContent === "stale sidebar title";
         const sidebarHasNoCustomStatusDisplay =
           !sidebarAnchor?.querySelector('[data-chatgpt-sidebar-sync-status="true"]') &&
           !sidebarAnchor?.hasAttribute("data-chatgpt-async-active");
@@ -1642,30 +1604,19 @@ function harnessHtml(): string {
           metadataMenuExists,
           metadataDomMountMadeNoRequests,
           metadataInitialGets: afterMutation.metadataInitialGets,
-          backendRequestContextCaptured,
+          sidebarRefreshRemoved,
+          sidebarTitleUnchanged,
           noAutomaticSidebarRequests,
           idleSidebarDetailDidNotRepeat,
           idleSidebarListDidNotRepeatAtLegacyCadence,
-          sidebarRefreshButtonExists,
-          sidebarRefreshStyleInstalled,
-          sidebarRefreshUsesIconAndText,
-          sidebarOnlyHasRefreshButton,
           conversationRefreshUiRemoved,
           conversationRefreshMenuRemoved,
-          sidebarRefreshIconPreserved,
-          sidebarManualRefreshTriggered,
-          authenticatedSidebarListProbeUsed:
-            afterMutation.authenticatedSidebarListProbeGets > 0,
-          authenticatedSidebarDetailProbeUsed:
-            afterMutation.authenticatedSidebarDetailProbeGets > 0,
           noDeliveryPolling:
             afterMutation.authenticatedPersistenceProbeGets === 0 &&
             afterMutation.deliveryIncludeMessageIds.length === 0,
           unauthorizedProbeGets: afterMutation.unauthorizedProbeGets,
-          sidebarTitleFresh,
           sidebarHasNoCustomStatusDisplay,
           sidebarStillHasNoCustomStatusDisplay,
-          sidebarListRefreshed: afterMutation.sidebarListGets >= 1,
           backgroundSendDidNotShowStatus,
           inlineSendingStatus,
           inlineAcceptedStatus,
@@ -2581,26 +2532,17 @@ const expected = {
   metadataMenuExists: true,
   metadataDomMountMadeNoRequests: true,
   metadataInitialGets: 1,
-  backendRequestContextCaptured: true,
+  sidebarRefreshRemoved: true,
+  sidebarTitleUnchanged: true,
   noAutomaticSidebarRequests: true,
   idleSidebarDetailDidNotRepeat: true,
   idleSidebarListDidNotRepeatAtLegacyCadence: true,
-  sidebarRefreshButtonExists: true,
-  sidebarRefreshStyleInstalled: true,
-  sidebarRefreshUsesIconAndText: true,
-  sidebarOnlyHasRefreshButton: true,
   conversationRefreshUiRemoved: true,
   conversationRefreshMenuRemoved: true,
-  sidebarRefreshIconPreserved: true,
-  sidebarManualRefreshTriggered: true,
-  authenticatedSidebarListProbeUsed: true,
-  authenticatedSidebarDetailProbeUsed: true,
   noDeliveryPolling: true,
   unauthorizedProbeGets: 0,
-  sidebarTitleFresh: true,
   sidebarHasNoCustomStatusDisplay: true,
   sidebarStillHasNoCustomStatusDisplay: true,
-  sidebarListRefreshed: true,
   backgroundSendDidNotShowStatus: true,
   inlineSendingStatus: true,
   inlineAcceptedStatus: true,
