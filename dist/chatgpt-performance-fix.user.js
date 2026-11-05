@@ -1,15 +1,15 @@
 // ==UserScript==
-// @name         ChatGPT Performance Fix
-// @name:zh-CN   ChatGPT 性能优化
-// @namespace    https://github.com/canxin121
+// @name         ChatGPT Performance Fix (B416-JAFLY fork)
+// @name:zh-CN   ChatGPT 性能优化（B416-JAFLY fork）
+// @namespace    https://github.com/B416-JAFLY
 // @version      0.1.1
 // @description  Improve ChatGPT performance on long conversations.
 // @description:zh-CN 改善 ChatGPT 长会话性能。
 // @author       canxin
-// @homepageURL  https://github.com/canxin121/chatgpt-web-performance-fix
-// @supportURL   https://github.com/canxin121/chatgpt-web-performance-fix/issues
-// @updateURL    https://raw.githubusercontent.com/canxin121/chatgpt-web-performance-fix/main/dist/chatgpt-performance-fix.user.js
-// @downloadURL  https://raw.githubusercontent.com/canxin121/chatgpt-web-performance-fix/main/dist/chatgpt-performance-fix.user.js
+// @homepageURL  https://github.com/B416-JAFLY/chatgpt-web-performance-fix
+// @supportURL   https://github.com/B416-JAFLY/chatgpt-web-performance-fix/issues
+// @updateURL    https://raw.githubusercontent.com/B416-JAFLY/chatgpt-web-performance-fix/improve/observer-overhead/dist/chatgpt-performance-fix.user.js
+// @downloadURL  https://raw.githubusercontent.com/B416-JAFLY/chatgpt-web-performance-fix/improve/observer-overhead/dist/chatgpt-performance-fix.user.js
 // @match        https://chatgpt.com/*
 // @run-at       document-start
 // @sandbox      raw
@@ -124,11 +124,11 @@
       if (!answer) {
         const forcedInTurn = turn.filter((entry) => forceKeepNodeIds.has(entry.id));
         if (forcedInTurn.length > 0) {
-          const selected2 = new Set([
+          const selected = new Set([
             user.id,
             ...forcedInTurn.map((entry) => entry.id)
           ]);
-          collapsed.push(...turn.filter((entry) => selected2.has(entry.id)));
+          collapsed.push(...turn.filter((entry) => selected.has(entry.id)));
         } else {
           collapsed.push(...turn);
         }
@@ -586,6 +586,23 @@
     return url.href;
   }
 
+  // src/sidebar-mutations.ts
+  function sidebarMayHaveChanged(records) {
+    for (const record of records) {
+      const target = record.target;
+      if (target.nodeType === 1 && target.closest("nav,aside"))
+        return true;
+      for (const node of record.addedNodes) {
+        if (node.nodeType !== 1)
+          continue;
+        const element = node;
+        if (element.matches("nav,aside") || element.querySelector("nav,aside"))
+          return true;
+      }
+    }
+    return false;
+  }
+
   // src/chatgpt-performance-fix.user.ts
   var SCRIPT_NAME = "ChatGPT Long Conversation Performance Fix";
   var SETTINGS_KEY = "chatgpt-performance-fix:settings:v1";
@@ -939,7 +956,7 @@
       return null;
     }
     try {
-      const source = '(()=>{var F={minNodeCount:250,recentFullTurns:1,preserveCurrentParent:!1,collapseTurnsToQuestionAnswer:!1},h=new Set(["system","developer"]),y=new Set(["code","execution_output","thoughts"]);function P(G){return new TextEncoder().encode(JSON.stringify(G)).byteLength}function B(G){if(!G)return"root/no-message";return`${G.author?.role??"unknown"}/${G.content?.content_type??"unknown"}`}function q(G){return B(G.message)}function w(G,V={}){return{changed:G==="optimized",reason:G,originalNodes:0,activePathNodes:0,keptNodes:0,removedOffPathNodes:0,removedHistoricNodes:0,userTurns:0,recentFullTurns:0,removedByKind:{},...V}}function b(G){return typeof G==="object"&&G!==null&&!Array.isArray(G)}function g(G){if("__paginatedConversationPage"in G)return!0;let V=G.mapping;return Boolean(V&&Object.keys(V).some(($)=>$.startsWith("paginated-root:")))}function f(G){if(!G)return!0;if(G.metadata?.is_visually_hidden_from_conversation===!0)return!1;let V=G.author?.role;if(V==="user"||V&&h.has(V))return!0;if(V==="tool")return!1;if(V!=="assistant")return!0;if(G.channel==="final")return!0;if(G.recipient!=null&&G.recipient!=="all")return!1;let $=G.content?.content_type;return!$||!y.has($)}function m(G){return f(G.message)}function u(G,V){let $=[],X=new Set,Q=V;while(Q!=null){if(X.has(Q))return null;X.add(Q);let Y=G[Q];if(!Y)return null;$.push({id:Q,node:Y}),Q=Y.parent}return $.reverse(),$}function i(G,V){let $=[],X=[],Q=()=>{if(X.length===0)return;let Y=X.find(({node:J})=>J.message?.author?.role==="user");if(!Y){$.push(...X),X=[];return}let L=X.filter(({node:J})=>J.message?.author?.role==="assistant"&&f(J.message)),A=[...L].reverse().find(({node:J})=>J.message?.channel==="final")??L.at(-1);if(!A){let J=X.filter((D)=>V.has(D.id));if(J.length>0){let D=new Set([Y.id,...J.map((R)=>R.id)]);$.push(...X.filter((R)=>D.has(R.id)))}else $.push(...X);X=[];return}let z=new Set([Y.id,A.id]);for(let J of X){if(V.has(J.id))z.add(J.id);let D=J.node.message?.author?.role;if(D&&h.has(D))z.add(J.id)}$.push(...X.filter((J)=>z.has(J.id))),X=[]};for(let Y of G){if(Y.node.message?.author?.role==="user")Q();if(X.length>0||Y.node.message?.author?.role==="user")X.push(Y);else $.push(Y)}return Q(),$}function T(G,V={}){let $={...F,...V,minNodeCount:Math.max(0,Math.floor(V.minNodeCount??F.minNodeCount)),recentFullTurns:Math.max(0,Math.floor(V.recentFullTurns??F.recentFullTurns)),preserveCurrentParent:V.preserveCurrentParent??F.preserveCurrentParent,collapseTurnsToQuestionAnswer:V.collapseTurnsToQuestionAnswer??F.collapseTurnsToQuestionAnswer};if(!b(G)||!b(G.mapping))return{payload:G,stats:w("invalid-payload")};let X=G.mapping,Q=Object.keys(X).length;if(g(G))return{payload:G,stats:w("already-paginated",{originalNodes:Q,keptNodes:Q,recentFullTurns:$.recentFullTurns})};if(Q<$.minNodeCount)return{payload:G,stats:w("below-threshold",{originalNodes:Q,keptNodes:Q,recentFullTurns:$.recentFullTurns})};if(typeof G.current_node!=="string")return{payload:G,stats:w("invalid-payload",{originalNodes:Q,keptNodes:Q,recentFullTurns:$.recentFullTurns})};let Y=u(X,G.current_node);if(!Y||Y.length===0)return{payload:G,stats:w("invalid-active-path",{originalNodes:Q,keptNodes:Q,recentFullTurns:$.recentFullTurns})};let L=Y.reduce((W,{node:C})=>W+(C.message?.author?.role==="user"?1:0),0),A=Math.max(0,L-$.recentFullTurns),z=new Set([G.current_node]);if($.preserveCurrentParent){let W=X[G.current_node]?.parent;if(typeof W==="string"&&W.length>0)z.add(W)}let J=[],D={},R=-1;for(let W of Y){if(W.node.message?.author?.role==="user")R+=1;if($.recentFullTurns>0&&R>=A||m(W.node)||z.has(W.id))J.push(W);else{let U=q(W.node);D[U]=(D[U]??0)+1}}if($.collapseTurnsToQuestionAnswer){let W=i(J,z);if(W.length<J.length){let C=new Set(W.map((E)=>E.id));for(let E of J){if(C.has(E.id))continue;let U=q(E.node);D[U]=(D[U]??0)+1}J=W}}let j=Q-Y.length,Z=Y.length-J.length;if(j<=0&&Z<=0)return{payload:G,stats:w("no-reduction",{originalNodes:Q,activePathNodes:Y.length,keptNodes:Q,userTurns:L,recentFullTurns:$.recentFullTurns})};let M={};for(let W=0;W<J.length;W+=1){let{id:C,node:E}=J[W],U=J[W-1]?.id??null,N=J[W+1]?.id;M[C]={...E,id:E.id??C,parent:U,children:N?[N]:[]}}let O=new Set(J.map(({node:W})=>W.message?.id).filter((W)=>typeof W==="string")),H=Array.isArray(G.moderation_results)?G.moderation_results.filter((W)=>typeof W.message_id!=="string"||O.has(W.message_id)):G.moderation_results;return{payload:{...G,mapping:M,current_node:J.at(-1)?.id??G.current_node,...H===void 0?{}:{moderation_results:H}},stats:w("optimized",{originalNodes:Q,activePathNodes:Y.length,keptNodes:J.length,removedOffPathNodes:j,removedHistoricNodes:Z,userTurns:L,recentFullTurns:$.recentFullTurns,removedByKind:D})}}function p(G,V=new Set){if(!G.some((Y)=>Y.author?.role==="user"))return G;let $=[],X=[],Q=()=>{if(X.length===0)return;let Y=X.find((J)=>J.author?.role==="user"),L=X.filter((J)=>J.author?.role==="assistant"&&f(J)),A=[...L].reverse().find((J)=>J.channel==="final")??L.at(-1);if(!Y||!A){$.push(...X),X=[];return}let z=new Set([Y,A]);for(let J of X)if(typeof J.id==="string"&&V.has(J.id))z.add(J);$.push(...X.filter((J)=>z.has(J))),X=[]};for(let Y of G){if(Y.author?.role==="user")Q();if(X.length>0||Y.author?.role==="user")X.push(Y)}return Q(),$.length>0?$:G}function v(G,V={}){let $=Array.isArray(G.messages)?G.messages:null;if(!$)return{payload:G,stats:{changed:!1,originalMessages:0,keptMessages:0,removedMessages:0,originalBytes:0,keptBytes:0,userTurns:0,recentFullTurns:0,removedByKind:{}}};let X=Math.max(0,Math.floor(V.recentFullTurns??0)),Q=new Set(V.forceKeepMessageIds??[]),Y=$.reduce((H,_)=>H+(_.author?.role==="user"?1:0),0),L=X>0&&Y===0,A=Math.max(0,Y-X),z=[],J={},D=-1;for(let H of $){if(H.author?.role==="user")D+=1;let _=H.id,W=X>0&&D>=A;if(L||typeof _==="string"&&Q.has(_)||W||f(H))z.push(H);else{let E=B(H);J[E]=(J[E]??0)+1}}if(V.collapseTurnsToQuestionAnswer===!0&&X===0&&Y>0){let H=p(z,Q);if(H.length<z.length){let _=new Set(H);for(let W of z){if(_.has(W))continue;let C=B(W);J[C]=(J[C]??0)+1}z=H}}if($.length>0&&z.length===0){let H=$.at(-1);z.push(H);let _=B(H);if(J[_]!=null){if(J[_]-=1,J[_]<=0)delete J[_]}}let R=new Set(z.map((H)=>H.id).filter((H)=>typeof H==="string")),j=Array.isArray(G.moderation_results)?G.moderation_results.filter((H)=>typeof H.message_id!=="string"||R.has(H.message_id)):G.moderation_results,Z=$.reduce((H,_)=>H+P(_),0),M=z.reduce((H,_)=>H+P(_),0),O=z.length!==$.length;return{payload:O?{...G,messages:z,...j===void 0?{}:{moderation_results:j}}:G,stats:{changed:O,originalMessages:$.length,keptMessages:z.length,removedMessages:$.length-z.length,originalBytes:Z,keptBytes:M,userTurns:Y,recentFullTurns:X,removedByKind:J}}}function x(G,V={}){if(G.length===0)return[];let $=Math.max(1,Math.floor(V.maxTurns??1)),X=Math.max(1,Math.floor(V.maxMessages??16)),Q=Math.max(1024,Math.floor(V.maxBytes??131072)),Y=V.allowSplitTurns??!0,L=[],A=[];for(let Z of G){if(Z.author?.role==="user"&&A.length>0)L.push(A),A=[];A.push(Z)}if(A.length>0)L.push(A);let z=[];for(let Z of L){let M=Z.reduce((C,E)=>C+P(E),0);if(!Y||Z.length<=X&&M<=Q){z.push({messages:Z,startsTurn:!0,bytes:M});continue}let O=[],H=[],_=0;for(let C=Z.length-1;C>=0;C-=1){let E=Z[C],U=P(E);if(H.length>0&&(H.length+1>X||_+U>Q))O.push({messages:H,bytes:_}),H=[],_=0;H.unshift(E),_+=U}if(H.length>0)O.push({messages:H,bytes:_});let W=O.reverse();for(let C=0;C<W.length;C+=1){let E=W[C];z.push({...E,startsTurn:C===0})}}let J=[],D=[],R=0,j=0;for(let Z=z.length-1;Z>=0;Z-=1){let M=z[Z],O=j+(M.startsTurn?1:0);if(D.length>0&&(O>$||D.length+M.messages.length>X||R+M.bytes>Q))J.push(D),D=[],R=0,j=0;D=[...M.messages,...D],R+=M.bytes,j+=M.startsTurn?1:0}if(D.length>0)J.push(D);return J}function S(G){if(G.buffer instanceof ArrayBuffer)return JSON.parse(new TextDecoder().decode(G.buffer));if(typeof G.text!=="string")throw Error("Worker request is missing JSON text/buffer");return JSON.parse(G.text)}function l(G){return G==="finished_successfully"||G==="finished"||G==="complete"}function d(G){if(typeof G.current_node!=="string"||!Array.isArray(G.messages))return;return G.messages.find((V)=>V.id===G.current_node)}function c(G){if(G.async_status!=null||!Array.isArray(G.messages))return!0;if(G.messages.some(($)=>["in_progress","streaming","pending"].includes(String($.status))))return!0;let V=d(G);return!V||!l(V.status)}function n(G){return!c(G)}function r(G){if(!Array.isArray(G.messages)||typeof G.current_node!=="string")return[];let V=new Map(G.messages.filter((Q)=>typeof Q.id==="string").map((Q)=>[Q.id,Q])),$=new Set([G.current_node]),X=V.get(G.current_node);if(X?.author?.role==="tool"){let Q=X.metadata?.parent_id;if(typeof Q==="string"&&V.has(Q))$.add(Q)}return[...$]}var K=new Map,o=1;function t(G){if(G.author?.role!=="assistant")return!1;if(G.metadata?.is_visually_hidden_from_conversation===!0)return!1;if(G.recipient!=null&&G.recipient!=="all")return!1;if(G.channel==="final")return!0;return!["code","execution_output","thoughts","reasoning_recap"].includes(String(G.content?.content_type??""))}function a(G,V){let $=-1;for(let X=0;X<G.length;X+=1)if(G[X]?.author?.role==="user")$=X;if($<0)return!1;return G.slice($+1).some((X)=>t(X)&&(!V||X.channel==="final"))}function s(G,V){let $=new Set,X=[];for(let Q of[...G,...V]){if(typeof Q.id==="string"){if($.has(Q.id))continue;$.add(Q.id)}X.push(Q)}return X}function e(G,V){return{...G,messages:s(Array.isArray(V.messages)?V.messages:[],Array.isArray(G.messages)?G.messages:[]),page_info:V.page_info,safe_urls:[...new Set([...V.safe_urls??[],...G.safe_urls??[]])],blocked_urls:[...new Set([...V.blocked_urls??[],...G.blocked_urls??[]])]}}function I(G,V){let $=Array.isArray(V.payload.messages)?V.payload.messages:[],X=V.payload.page_info?.has_previous_page===!0&&typeof V.payload.page_info.start_cursor==="string"?V.payload.page_info.start_cursor:null;return{token:G,complete:a($,V.requireFinal),cursor:X,messageCount:$.length}}var GG=Math.random().toString(36).slice(2),VG=1;function XG(G,V){let $=G.split(`\n`),X=[];for(let z=0;z<$.length;z+=1){let J=$[z].match(/^\\s*(`{3,}|~{3,})\\s*([^`]*)$/);if(!J)continue;let D=J[1],R=D[0],j=new RegExp(`^\\\\s*${R}{${D.length},}\\\\s*$`),Z=z+1;while(Z<$.length&&!j.test($[Z]))Z+=1;if(Z>=$.length)continue;let M=J[2].trim().split(/\\s+/,1)[0]??"",O=$.slice(z+1,Z).join(`\n`);X.push({start:z,end:Z,language:M,code:O}),z=Z}let Q=X.reduce((z,J)=>z+J.code.length,0);if(X.length<4&&Q<8000)return{text:G,blocks:[]};let Y=new Map(X.map((z)=>[z.start,z])),L=[],A=[];for(let z=0;z<$.length;z+=1){let J=Y.get(z);if(!J){L.push($[z]);continue}let D=`${GG}-${V}-${VG++}`,R=Math.max(1,J.code.split(`\n`).length);A.push({token:D,language:J.language,code:J.code,lineCount:R}),L.push(`[代码块](https://chatgpt.com/#cgptperf-code=${D}&lines=${R})`),z=J.end}return{text:L.join(`\n`),blocks:A}}function $G(G){if(!Array.isArray(G.messages))return{payload:G,codeBlocks:[]};let V=[],$=G.messages.map((X,Q)=>{if(!["assistant","user"].includes(String(X.author?.role))||!Array.isArray(X.content?.parts))return X;let Y=!1,L=X.content.parts.map((A,z)=>{if(typeof A!=="string")return A;let J=XG(A,`m${Q}p${z}`);if(J.blocks.length===0)return A;return Y=!0,V.push(...J.blocks),J.text});if(!Y)return X;return{...X,content:{...X.content,parts:L}}});return{payload:{...G,messages:$},codeBlocks:V}}function k(G,V){let $=V.apiKind==="paginated-initial",X=$?c(G):!1,Q=v(G,{recentFullTurns:$&&X?V.recentFullTurns??1:0,forceKeepMessageIds:$?r(G):[],collapseTurnsToQuestionAnswer:V.apiKind==="paginated-messages"||$&&!X}),Y=V.lightweightCodeBlocks===!0&&!X?$G(Q.payload):{payload:Q.payload,codeBlocks:[]},L=Array.isArray(Y.payload.messages)?Y.payload.messages:[];return{payload:Y.payload,stats:Q.stats,chunks:x(L,V.chunkOptions),codeBlocks:Y.codeBlocks,active:X,cacheable:$&&n(G)}}self.addEventListener("message",(G)=>{let V=G.data;try{if(V.operation==="parse"){self.postMessage({id:V.id,ok:!0,value:S(V)});return}if(V.operation==="optimize-legacy"){let X=S(V),Q=T(X,V.legacyOptions);self.postMessage({id:V.id,ok:!0,value:{payload:Q.payload,stats:Q.stats}});return}if(V.operation==="start-paginated-job"){let X=S(V),Q=`page-${o++}`,Y={payload:X,requireFinal:V.requireFinal===!0};K.set(Q,Y),self.postMessage({id:V.id,ok:!0,value:I(Q,Y)});return}if(V.operation==="prepend-paginated-job"){let X=V.token??"",Q=K.get(X);if(!Q)throw Error("Unknown paginated job");let Y=S(V);Q.payload=e(Q.payload,Y),self.postMessage({id:V.id,ok:!0,value:I(X,Q)});return}if(V.operation==="finish-paginated-job"){let X=V.token??"",Q=K.get(X);if(!Q)throw Error("Unknown paginated job");K.delete(X),self.postMessage({id:V.id,ok:!0,value:k(Q.payload,V)});return}if(V.operation==="cancel-paginated-job"){K.delete(V.token??""),self.postMessage({id:V.id,ok:!0,value:null});return}let $=S(V);self.postMessage({id:V.id,ok:!0,value:k($,V)})}catch($){self.postMessage({id:V.id,ok:!1,error:$ instanceof Error?$.message:String($)})}});})();\n';
+      const source = '(()=>{var _={minNodeCount:250,recentFullTurns:1,preserveCurrentParent:!1,collapseTurnsToQuestionAnswer:!1},F=new Set(["system","developer"]),L=new Set(["code","execution_output","thoughts"]);function w(e){return new TextEncoder().encode(JSON.stringify(e)).byteLength}function x(e){if(!e)return"root/no-message";return`${e.author?.role??"unknown"}/${e.content?.content_type??"unknown"}`}function S(e){return x(e.message)}function b(e,n={}){return{changed:e==="optimized",reason:e,originalNodes:0,activePathNodes:0,keptNodes:0,removedOffPathNodes:0,removedHistoricNodes:0,userTurns:0,recentFullTurns:0,removedByKind:{},...n}}function O(e){return typeof e==="object"&&e!==null&&!Array.isArray(e)}function j(e){if("__paginatedConversationPage"in e)return!0;let n=e.mapping;return Boolean(n&&Object.keys(n).some((s)=>s.startsWith("paginated-root:")))}function A(e){if(!e)return!0;if(e.metadata?.is_visually_hidden_from_conversation===!0)return!1;let n=e.author?.role;if(n==="user"||n&&F.has(n))return!0;if(n==="tool")return!1;if(n!=="assistant")return!0;if(e.channel==="final")return!0;if(e.recipient!=null&&e.recipient!=="all")return!1;let s=e.content?.content_type;return!s||!L.has(s)}function Q(e){return A(e.message)}function J(e,n){let s=[],t=new Set,o=n;while(o!=null){if(t.has(o))return null;t.add(o);let a=e[o];if(!a)return null;s.push({id:o,node:a}),o=a.parent}return s.reverse(),s}function U(e,n){let s=[],t=[],o=()=>{if(t.length===0)return;let a=t.find(({node:r})=>r.message?.author?.role==="user");if(!a){s.push(...t),t=[];return}let f=t.filter(({node:r})=>r.message?.author?.role==="assistant"&&A(r.message)),g=[...f].reverse().find(({node:r})=>r.message?.channel==="final")??f.at(-1);if(!g){let r=t.filter((d)=>n.has(d.id));if(r.length>0){let d=new Set([a.id,...r.map((y)=>y.id)]);s.push(...t.filter((y)=>d.has(y.id)))}else s.push(...t);t=[];return}let i=new Set([a.id,g.id]);for(let r of t){if(n.has(r.id))i.add(r.id);let d=r.node.message?.author?.role;if(d&&F.has(d))i.add(r.id)}s.push(...t.filter((r)=>i.has(r.id))),t=[]};for(let a of e){if(a.node.message?.author?.role==="user")o();if(t.length>0||a.node.message?.author?.role==="user")t.push(a);else s.push(a)}return o(),s}function R(e,n={}){let s={..._,...n,minNodeCount:Math.max(0,Math.floor(n.minNodeCount??_.minNodeCount)),recentFullTurns:Math.max(0,Math.floor(n.recentFullTurns??_.recentFullTurns)),preserveCurrentParent:n.preserveCurrentParent??_.preserveCurrentParent,collapseTurnsToQuestionAnswer:n.collapseTurnsToQuestionAnswer??_.collapseTurnsToQuestionAnswer};if(!O(e)||!O(e.mapping))return{payload:e,stats:b("invalid-payload")};let t=e.mapping,o=Object.keys(t).length;if(j(e))return{payload:e,stats:b("already-paginated",{originalNodes:o,keptNodes:o,recentFullTurns:s.recentFullTurns})};if(o<s.minNodeCount)return{payload:e,stats:b("below-threshold",{originalNodes:o,keptNodes:o,recentFullTurns:s.recentFullTurns})};if(typeof e.current_node!=="string")return{payload:e,stats:b("invalid-payload",{originalNodes:o,keptNodes:o,recentFullTurns:s.recentFullTurns})};let a=J(t,e.current_node);if(!a||a.length===0)return{payload:e,stats:b("invalid-active-path",{originalNodes:o,keptNodes:o,recentFullTurns:s.recentFullTurns})};let f=a.reduce((l,{node:h})=>l+(h.message?.author?.role==="user"?1:0),0),g=Math.max(0,f-s.recentFullTurns),i=new Set([e.current_node]);if(s.preserveCurrentParent){let l=t[e.current_node]?.parent;if(typeof l==="string"&&l.length>0)i.add(l)}let r=[],d={},y=-1;for(let l of a){if(l.node.message?.author?.role==="user")y+=1;if(s.recentFullTurns>0&&y>=g||Q(l.node)||i.has(l.id))r.push(l);else{let P=S(l.node);d[P]=(d[P]??0)+1}}if(s.collapseTurnsToQuestionAnswer){let l=U(r,i);if(l.length<r.length){let h=new Set(l.map((m)=>m.id));for(let m of r){if(h.has(m.id))continue;let P=S(m.node);d[P]=(d[P]??0)+1}r=l}}let k=o-a.length,c=a.length-r.length;if(k<=0&&c<=0)return{payload:e,stats:b("no-reduction",{originalNodes:o,activePathNodes:a.length,keptNodes:o,userTurns:f,recentFullTurns:s.recentFullTurns})};let v={};for(let l=0;l<r.length;l+=1){let{id:h,node:m}=r[l],P=r[l-1]?.id??null,N=r[l+1]?.id;v[h]={...m,id:m.id??h,parent:P,children:N?[N]:[]}}let C=new Set(r.map(({node:l})=>l.message?.id).filter((l)=>typeof l==="string")),u=Array.isArray(e.moderation_results)?e.moderation_results.filter((l)=>typeof l.message_id!=="string"||C.has(l.message_id)):e.moderation_results;return{payload:{...e,mapping:v,current_node:r.at(-1)?.id??e.current_node,...u===void 0?{}:{moderation_results:u}},stats:b("optimized",{originalNodes:o,activePathNodes:a.length,keptNodes:r.length,removedOffPathNodes:k,removedHistoricNodes:c,userTurns:f,recentFullTurns:s.recentFullTurns,removedByKind:d})}}function W(e,n=new Set){if(!e.some((a)=>a.author?.role==="user"))return e;let s=[],t=[],o=()=>{if(t.length===0)return;let a=t.find((r)=>r.author?.role==="user"),f=t.filter((r)=>r.author?.role==="assistant"&&A(r)),g=[...f].reverse().find((r)=>r.channel==="final")??f.at(-1);if(!a||!g){s.push(...t),t=[];return}let i=new Set([a,g]);for(let r of t)if(typeof r.id==="string"&&n.has(r.id))i.add(r);s.push(...t.filter((r)=>i.has(r))),t=[]};for(let a of e){if(a.author?.role==="user")o();if(t.length>0||a.author?.role==="user")t.push(a)}return o(),s.length>0?s:e}function I(e,n={}){let s=Array.isArray(e.messages)?e.messages:null;if(!s)return{payload:e,stats:{changed:!1,originalMessages:0,keptMessages:0,removedMessages:0,originalBytes:0,keptBytes:0,userTurns:0,recentFullTurns:0,removedByKind:{}}};let t=Math.max(0,Math.floor(n.recentFullTurns??0)),o=new Set(n.forceKeepMessageIds??[]),a=s.reduce((u,p)=>u+(p.author?.role==="user"?1:0),0),f=t>0&&a===0,g=Math.max(0,a-t),i=[],r={},d=-1;for(let u of s){if(u.author?.role==="user")d+=1;let p=u.id,l=t>0&&d>=g;if(f||typeof p==="string"&&o.has(p)||l||A(u))i.push(u);else{let m=x(u);r[m]=(r[m]??0)+1}}if(n.collapseTurnsToQuestionAnswer===!0&&t===0&&a>0){let u=W(i,o);if(u.length<i.length){let p=new Set(u);for(let l of i){if(p.has(l))continue;let h=x(l);r[h]=(r[h]??0)+1}i=u}}if(s.length>0&&i.length===0){let u=s.at(-1);i.push(u);let p=x(u);if(r[p]!=null){if(r[p]-=1,r[p]<=0)delete r[p]}}let y=new Set(i.map((u)=>u.id).filter((u)=>typeof u==="string")),k=Array.isArray(e.moderation_results)?e.moderation_results.filter((u)=>typeof u.message_id!=="string"||y.has(u.message_id)):e.moderation_results,c=s.reduce((u,p)=>u+w(p),0),v=i.reduce((u,p)=>u+w(p),0),C=i.length!==s.length;return{payload:C?{...e,messages:i,...k===void 0?{}:{moderation_results:k}}:e,stats:{changed:C,originalMessages:s.length,keptMessages:i.length,removedMessages:s.length-i.length,originalBytes:c,keptBytes:v,userTurns:a,recentFullTurns:t,removedByKind:r}}}function B(e,n={}){if(e.length===0)return[];let s=Math.max(1,Math.floor(n.maxTurns??1)),t=Math.max(1,Math.floor(n.maxMessages??16)),o=Math.max(1024,Math.floor(n.maxBytes??131072)),a=n.allowSplitTurns??!0,f=[],g=[];for(let c of e){if(c.author?.role==="user"&&g.length>0)f.push(g),g=[];g.push(c)}if(g.length>0)f.push(g);let i=[];for(let c of f){let v=c.reduce((h,m)=>h+w(m),0);if(!a||c.length<=t&&v<=o){i.push({messages:c,startsTurn:!0,bytes:v});continue}let C=[],u=[],p=0;for(let h=c.length-1;h>=0;h-=1){let m=c[h],P=w(m);if(u.length>0&&(u.length+1>t||p+P>o))C.push({messages:u,bytes:p}),u=[],p=0;u.unshift(m),p+=P}if(u.length>0)C.push({messages:u,bytes:p});let l=C.reverse();for(let h=0;h<l.length;h+=1){let m=l[h];i.push({...m,startsTurn:h===0})}}let r=[],d=[],y=0,k=0;for(let c=i.length-1;c>=0;c-=1){let v=i[c],C=k+(v.startsTurn?1:0);if(d.length>0&&(C>s||d.length+v.messages.length>t||y+v.bytes>o))r.push(d),d=[],y=0,k=0;d=[...v.messages,...d],y+=v.bytes,k+=v.startsTurn?1:0}if(d.length>0)r.push(d);return r}function T(e){if(e.buffer instanceof ArrayBuffer)return JSON.parse(new TextDecoder().decode(e.buffer));if(typeof e.text!=="string")throw Error("Worker request is missing JSON text/buffer");return JSON.parse(e.text)}function q(e){return e==="finished_successfully"||e==="finished"||e==="complete"}function H(e){if(typeof e.current_node!=="string"||!Array.isArray(e.messages))return;return e.messages.find((n)=>n.id===e.current_node)}function K(e){if(e.async_status!=null||!Array.isArray(e.messages))return!0;if(e.messages.some((s)=>["in_progress","streaming","pending"].includes(String(s.status))))return!0;let n=H(e);return!n||!q(n.status)}function D(e){return!K(e)}function Y(e){if(!Array.isArray(e.messages)||typeof e.current_node!=="string")return[];let n=new Map(e.messages.filter((o)=>typeof o.id==="string").map((o)=>[o.id,o])),s=new Set([e.current_node]),t=n.get(e.current_node);if(t?.author?.role==="tool"){let o=t.metadata?.parent_id;if(typeof o==="string"&&n.has(o))s.add(o)}return[...s]}var M=new Map,Z=1;function G(e){if(e.author?.role!=="assistant")return!1;if(e.metadata?.is_visually_hidden_from_conversation===!0)return!1;if(e.recipient!=null&&e.recipient!=="all")return!1;if(e.channel==="final")return!0;return!["code","execution_output","thoughts","reasoning_recap"].includes(String(e.content?.content_type??""))}function V(e,n){let s=-1;for(let t=0;t<e.length;t+=1)if(e[t]?.author?.role==="user")s=t;if(s<0)return!1;return e.slice(s+1).some((t)=>G(t)&&(!n||t.channel==="final"))}function X(e,n){let s=new Set,t=[];for(let o of[...e,...n]){if(typeof o.id==="string"){if(s.has(o.id))continue;s.add(o.id)}t.push(o)}return t}function ee(e,n){return{...e,messages:X(Array.isArray(n.messages)?n.messages:[],Array.isArray(e.messages)?e.messages:[]),page_info:n.page_info,safe_urls:[...new Set([...n.safe_urls??[],...e.safe_urls??[]])],blocked_urls:[...new Set([...n.blocked_urls??[],...e.blocked_urls??[]])]}}function z(e,n){let s=Array.isArray(n.payload.messages)?n.payload.messages:[],t=n.payload.page_info?.has_previous_page===!0&&typeof n.payload.page_info.start_cursor==="string"?n.payload.page_info.start_cursor:null;return{token:e,complete:V(s,n.requireFinal),cursor:t,messageCount:s.length}}var ne=Math.random().toString(36).slice(2),te=1;function se(e,n){let s=e.split(`\n`),t=[];for(let i=0;i<s.length;i+=1){let r=s[i].match(/^\\s*(`{3,}|~{3,})\\s*([^`]*)$/);if(!r)continue;let d=r[1],y=d[0],k=new RegExp(`^\\\\s*${y}{${d.length},}\\\\s*$`),c=i+1;while(c<s.length&&!k.test(s[c]))c+=1;if(c>=s.length)continue;let v=r[2].trim().split(/\\s+/,1)[0]??"",C=s.slice(i+1,c).join(`\n`);t.push({start:i,end:c,language:v,code:C}),i=c}let o=t.reduce((i,r)=>i+r.code.length,0);if(t.length<4&&o<8000)return{text:e,blocks:[]};let a=new Map(t.map((i)=>[i.start,i])),f=[],g=[];for(let i=0;i<s.length;i+=1){let r=a.get(i);if(!r){f.push(s[i]);continue}let d=`${ne}-${n}-${te++}`,y=Math.max(1,r.code.split(`\n`).length);g.push({token:d,language:r.language,code:r.code,lineCount:y}),f.push(`[代码块](https://chatgpt.com/#cgptperf-code=${d}&lines=${y})`),i=r.end}return{text:f.join(`\n`),blocks:g}}function re(e){if(!Array.isArray(e.messages))return{payload:e,codeBlocks:[]};let n=[],s=e.messages.map((t,o)=>{if(!["assistant","user"].includes(String(t.author?.role))||!Array.isArray(t.content?.parts))return t;let a=!1,f=t.content.parts.map((g,i)=>{if(typeof g!=="string")return g;let r=se(g,`m${o}p${i}`);if(r.blocks.length===0)return g;return a=!0,n.push(...r.blocks),r.text});if(!a)return t;return{...t,content:{...t.content,parts:f}}});return{payload:{...e,messages:s},codeBlocks:n}}function E(e,n){let s=n.apiKind==="paginated-initial",t=s?K(e):!1,o=I(e,{recentFullTurns:s&&t?n.recentFullTurns??1:0,forceKeepMessageIds:s?Y(e):[],collapseTurnsToQuestionAnswer:n.apiKind==="paginated-messages"||s&&!t}),a=n.lightweightCodeBlocks===!0&&!t?re(o.payload):{payload:o.payload,codeBlocks:[]},f=Array.isArray(a.payload.messages)?a.payload.messages:[];return{payload:a.payload,stats:o.stats,chunks:B(f,n.chunkOptions),codeBlocks:a.codeBlocks,active:t,cacheable:s&&D(e)}}self.addEventListener("message",(e)=>{let n=e.data;try{if(n.operation==="parse"){self.postMessage({id:n.id,ok:!0,value:T(n)});return}if(n.operation==="optimize-legacy"){let t=T(n),o=R(t,n.legacyOptions);self.postMessage({id:n.id,ok:!0,value:{payload:o.payload,stats:o.stats}});return}if(n.operation==="start-paginated-job"){let t=T(n),o=`page-${Z++}`,a={payload:t,requireFinal:n.requireFinal===!0};M.set(o,a),self.postMessage({id:n.id,ok:!0,value:z(o,a)});return}if(n.operation==="prepend-paginated-job"){let t=n.token??"",o=M.get(t);if(!o)throw Error("Unknown paginated job");let a=T(n);o.payload=ee(o.payload,a),self.postMessage({id:n.id,ok:!0,value:z(t,o)});return}if(n.operation==="finish-paginated-job"){let t=n.token??"",o=M.get(t);if(!o)throw Error("Unknown paginated job");M.delete(t),self.postMessage({id:n.id,ok:!0,value:E(o.payload,n)});return}if(n.operation==="cancel-paginated-job"){M.delete(n.token??""),self.postMessage({id:n.id,ok:!0,value:null});return}let s=T(n);self.postMessage({id:n.id,ok:!0,value:E(s,n)})}catch(s){self.postMessage({id:n.id,ok:!1,error:s instanceof Error?s.message:String(s)})}});})();\n';
       const url = pageWindow.URL.createObjectURL(new pageWindow.Blob([source], { type: "application/javascript" }));
       const worker = new pageWindow.Worker(url, {
         name: "chatgpt-performance-json"
@@ -1715,9 +1732,9 @@
             attributeObserver.disconnect();
             this.deferredCodeMirrorTargets.delete(target);
             observer.observe(target);
-            const root2 = pageWindow.document.documentElement;
-            const count2 = Number(root2.dataset.chatgptCodeMirrorIoResumed ?? "0");
-            root2.dataset.chatgptCodeMirrorIoResumed = String(count2 + 1);
+            const root = pageWindow.document.documentElement;
+            const count = Number(root.dataset.chatgptCodeMirrorIoResumed ?? "0");
+            root.dataset.chatgptCodeMirrorIoResumed = String(count + 1);
           });
           attributeObserver.observe(container, {
             attributes: true,
@@ -2415,7 +2432,10 @@
         pageWindow.setTimeout(() => updateRefreshButton(), 900);
       }
     };
-    const observer = new pageWindow.MutationObserver(scheduleDomSync);
+    const observer = new pageWindow.MutationObserver((records) => {
+      if (sidebarMayHaveChanged(records))
+        scheduleDomSync();
+    });
     const observeTarget = pageWindow.document.body ?? pageWindow.document.documentElement;
     if (observeTarget)
       observer.observe(observeTarget, { childList: true, subtree: true });
@@ -2998,8 +3018,8 @@
         });
       }
     };
-    const observer = new pageWindow.MutationObserver((records2) => {
-      for (const mutation of records2) {
+    const observer = new pageWindow.MutationObserver((records) => {
+      for (const mutation of records) {
         if (mutation.type === "attributes") {
           if (mutation.target instanceof pageWindow.Element) {
             scheduleScan(mutation.target);
@@ -3607,10 +3627,10 @@ html [data-chatgpt-static-code-state="loading"] pre {
             const hint = `/${filename.split("-")[0]}-`;
             smoothedMarkdownSourceHints.add(hint);
           }
-          const root2 = pageWindow.document.documentElement;
-          root2.dataset.chatgptSmoothedMarkdownSourceCount = String(smoothedMarkdownSourceHints.size);
-          const count = Number(root2.dataset.chatgptRichTextSkippedResizeObservers ?? "0");
-          root2.dataset.chatgptRichTextSkippedResizeObservers = String(count + 1);
+          const root = pageWindow.document.documentElement;
+          root.dataset.chatgptSmoothedMarkdownSourceCount = String(smoothedMarkdownSourceHints.size);
+          const count = Number(root.dataset.chatgptRichTextSkippedResizeObservers ?? "0");
+          root.dataset.chatgptRichTextSkippedResizeObservers = String(count + 1);
           return;
         }
         const container = findConversationCodeMirrorContainer(pageWindow, target);
@@ -3624,18 +3644,18 @@ html [data-chatgpt-static-code-state="loading"] pre {
             attributeObserver.disconnect();
             this.deferredCodeMirrorTargets.delete(target);
             this.native.observe(target, options);
-            const root3 = pageWindow.document.documentElement;
-            const count2 = Number(root3.dataset.chatgptCodeMirrorRoResumed ?? "0");
-            root3.dataset.chatgptCodeMirrorRoResumed = String(count2 + 1);
+            const root = pageWindow.document.documentElement;
+            const count = Number(root.dataset.chatgptCodeMirrorRoResumed ?? "0");
+            root.dataset.chatgptCodeMirrorRoResumed = String(count + 1);
           });
           attributeObserver.observe(container, {
             attributes: true,
             attributeFilter: ["data-chatgpt-rich-editor-state"]
           });
           this.deferredCodeMirrorTargets.set(target, attributeObserver);
-          const root2 = pageWindow.document.documentElement;
-          const count = Number(root2.dataset.chatgptCodeMirrorRoDeferred ?? "0");
-          root2.dataset.chatgptCodeMirrorRoDeferred = String(count + 1);
+          const root = pageWindow.document.documentElement;
+          const count = Number(root.dataset.chatgptCodeMirrorRoDeferred ?? "0");
+          root.dataset.chatgptCodeMirrorRoDeferred = String(count + 1);
           return;
         }
         this.native.observe(target, options);
@@ -3698,9 +3718,9 @@ html [data-chatgpt-static-code-state="loading"] pre {
     let activationFrame = null;
     let warmScanFrame = null;
     const incrementMetric = (name) => {
-      const root2 = pageWindow.document.documentElement;
-      const current = Number(root2.dataset[name] ?? "0");
-      root2.dataset[name] = String(current + 1);
+      const root = pageWindow.document.documentElement;
+      const current = Number(root.dataset[name] ?? "0");
+      root.dataset[name] = String(current + 1);
     };
     const activate = (item) => {
       if (!item.element.isConnected) {
@@ -4380,11 +4400,11 @@ html [data-chatgpt-static-code-state="loading"] pre {
       if (!nativeResponse.ok) {
         if (nativeResponse.status === 429) {
           const rateLimited = await materializeAndOptimizePaginated(pageWindow, nativeResponse, "paginated-initial", mode, legacyUrl, false, createLocalCursor, undefined, MODE_OPTIONS[mode].paginatedRenderTurns, observePayload);
-          const headers2 = new pageWindow.Headers(rateLimited.headers);
-          headers2.set("x-chatgpt-performance-fix-lazy", "rate-limited");
+          const headers = new pageWindow.Headers(rateLimited.headers);
+          headers.set("x-chatgpt-performance-fix-lazy", "rate-limited");
           return {
             ...rateLimited,
-            headers: [...headers2.entries()],
+            headers: [...headers.entries()],
             url: legacyUrl,
             cacheable: false,
             lazyInitial: true
@@ -4552,10 +4572,10 @@ html [data-chatgpt-static-code-state="loading"] pre {
         const existing = initialSnapshots.get(key);
         if (existing && !existing.rateLimited)
           initialSnapshots.delete(key);
-        const root2 = pageWindow.document.documentElement;
+        const root = pageWindow.document.documentElement;
         const reason = response.activeConversation === true ? "Active" : "StaleOrUnknown";
         const datasetKey = `chatgptInitialSnapshotSkipped${reason}`;
-        root2.dataset[datasetKey] = String(Number(root2.dataset[datasetKey] ?? "0") + 1);
+        root.dataset[datasetKey] = String(Number(root.dataset[datasetKey] ?? "0") + 1);
         return;
       }
       const now = Date.now();

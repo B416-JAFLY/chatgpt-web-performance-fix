@@ -3,17 +3,17 @@ import { mkdirSync, rmSync } from "node:fs";
 const VERSION = "0.1.1"; // Keep fixed unless the maintainer explicitly requests a change.
 
 const header = `// ==UserScript==
-// @name         ChatGPT Performance Fix
-// @name:zh-CN   ChatGPT 性能优化
-// @namespace    https://github.com/canxin121
+// @name         ChatGPT Performance Fix (B416-JAFLY fork)
+// @name:zh-CN   ChatGPT 性能优化（B416-JAFLY fork）
+// @namespace    https://github.com/B416-JAFLY
 // @version      ${VERSION}
 // @description  Improve ChatGPT performance on long conversations.
 // @description:zh-CN 改善 ChatGPT 长会话性能。
 // @author       canxin
-// @homepageURL  https://github.com/canxin121/chatgpt-web-performance-fix
-// @supportURL   https://github.com/canxin121/chatgpt-web-performance-fix/issues
-// @updateURL    https://raw.githubusercontent.com/canxin121/chatgpt-web-performance-fix/main/dist/chatgpt-performance-fix.user.js
-// @downloadURL  https://raw.githubusercontent.com/canxin121/chatgpt-web-performance-fix/main/dist/chatgpt-performance-fix.user.js
+// @homepageURL  https://github.com/B416-JAFLY/chatgpt-web-performance-fix
+// @supportURL   https://github.com/B416-JAFLY/chatgpt-web-performance-fix/issues
+// @updateURL    https://raw.githubusercontent.com/B416-JAFLY/chatgpt-web-performance-fix/improve/observer-overhead/dist/chatgpt-performance-fix.user.js
+// @downloadURL  https://raw.githubusercontent.com/B416-JAFLY/chatgpt-web-performance-fix/improve/observer-overhead/dist/chatgpt-performance-fix.user.js
 // @match        https://chatgpt.com/*
 // @run-at       document-start
 // @sandbox      raw

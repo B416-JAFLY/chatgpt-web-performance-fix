@@ -1,5 +1,7 @@
 # ChatGPT Performance Fix
 
+> 此分支是 B416-JAFLY 的实验性 fork，减少流式回复期间无关页面变动造成的侧栏扫描。[安装此分支的脚本](https://raw.githubusercontent.com/B416-JAFLY/chatgpt-web-performance-fix/improve/observer-overhead/dist/chatgpt-performance-fix.user.js)。安装前请在 Tampermonkey 中停用原版，避免两个脚本同时运行；此 fork 使用独立名称和命名空间，设置需要重新选择。
+
 用于改善 ChatGPT 长会话性能和滚动体验的 Tampermonkey 用户脚本。
 
 ## 功能

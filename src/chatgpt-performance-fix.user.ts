@@ -12,6 +12,7 @@ import {
   type OptimizationStats,
   type PaginatedOptimizationStats,
 } from "./optimizer";
+import { sidebarMayHaveChanged } from "./sidebar-mutations";
 
 declare const unsafeWindow: (Window & typeof globalThis) | undefined;
 declare const GM_registerMenuCommand:
@@ -2493,7 +2494,9 @@ function installSidebarFreshness(
     }
   };
 
-  const observer = new pageWindow.MutationObserver(scheduleDomSync);
+  const observer = new pageWindow.MutationObserver((records) => {
+    if (sidebarMayHaveChanged(records)) scheduleDomSync();
+  });
   const observeTarget = pageWindow.document.body ?? pageWindow.document.documentElement;
   if (observeTarget) observer.observe(observeTarget, { childList: true, subtree: true });
   scheduleDomSync();
