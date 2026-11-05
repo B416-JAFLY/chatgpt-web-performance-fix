@@ -11,7 +11,7 @@ window.IntersectionObserver=class {
  constructor(callback,options){this.callback=callback;this.options=options;this.targets=new Set();window.__observers.push(this)}
  observe(target){this.targets.add(target)} unobserve(target){this.targets.delete(target)} disconnect(){this.targets.clear()} takeRecords(){return []}
 };
-</script><script src="/script.js"></script><main><div data-turn-key="fixture"><div data-markdown-text-style="default"><div style="height:30000px"></div><div id="blocks"></div><table id="modern-table"><tr><td>fixture</td></tr></table></div></div></main><pre id="result">PENDING</pre><script>
+</script><script src="/script.js"></script><main><div class="thread-scroll-container" style="height:600px;overflow:auto"><div data-turn-key="fixture"><div data-markdown-text-style="default"><div style="height:30000px"></div><div id="blocks"></div><table id="modern-table"><tr><td>fixture</td></tr></table></div></div></div></main><pre id="result">PENDING</pre><script>
 (async()=>{try {
  const wait=ms=>new Promise(r=>setTimeout(r,ms));
  const blocks=document.querySelector('#blocks');
@@ -24,6 +24,7 @@ window.IntersectionObserver=class {
  const item=blocks.firstElementChild;
  const observer=window.__observers.find(o=>o.targets.has(item));
  if(!observer)throw Error('block was not observed');
+ if(observer.options.root!==document.querySelector('.thread-scroll-container'))throw Error('incorrect scroll root');
  item.remove();await wait(100);
  if(observer.targets.has(item))throw Error('detached block remains observed');
  blocks.prepend(item);await wait(100);

@@ -4176,7 +4176,7 @@ html [data-chatgpt-static-code-state="loading"] pre {
   // The hook deliberately suppresses pagination sentinels and must not be
   // involved in observing rich-text blocks.
   const NativeIntersectionObserver = pageWindow.IntersectionObserver;
-  const makeWarmObserver = (distance: number): IntersectionObserver | null => {
+  const makeWarmObserver = (distance: number, root: Element | null): IntersectionObserver | null => {
     if (typeof NativeIntersectionObserver !== "function") return null;
     return new NativeIntersectionObserver((entries) => {
       for (const entry of entries) {
@@ -4189,13 +4189,39 @@ html [data-chatgpt-static-code-state="loading"] pre {
         else enqueueActivation(item, rect.top > pageWindow.innerHeight
           ? rect.top - pageWindow.innerHeight : Math.max(0, -rect.bottom));
       }
-    }, { rootMargin: `${distance}px 0px` });
+    }, { root, rootMargin: `${distance}px 0px` });
   };
-  const blockObserver = makeWarmObserver(effectiveWarmDistance);
-  const editorObserver = makeWarmObserver(effectiveEditorWarmDistance);
+  type WarmObservers = { blocks: IntersectionObserver | null; editors: IntersectionObserver | null };
+  const observersByRoot = new WeakMap<Element, WarmObservers>();
+  const viewportObservers: WarmObservers = {
+    blocks: makeWarmObserver(effectiveWarmDistance, null),
+    editors: makeWarmObserver(effectiveEditorWarmDistance, null),
+  };
+  const observedBy = new WeakMap<Element, IntersectionObserver>();
+  const observerFor = (item: RichActivation): IntersectionObserver | null => {
+    const root = item.element.closest(".thread-scroll-container");
+    let observers = root ? observersByRoot.get(root) : viewportObservers;
+    if (!observers && root) {
+      observers = {
+        blocks: makeWarmObserver(effectiveWarmDistance, root),
+        editors: makeWarmObserver(effectiveEditorWarmDistance, root),
+      };
+      observersByRoot.set(root, observers);
+    }
+    return item.attribute === "data-chatgpt-rich-editor-state"
+      ? observers?.editors ?? null : observers?.blocks ?? null;
+  };
+  const observeHeavyElement = (item: RichActivation) => {
+    const observer = observerFor(item);
+    observedBy.get(item.element)?.unobserve(item.element);
+    if (observer) {
+      observedBy.set(item.element, observer);
+      observer.observe(item.element);
+    } else scheduleWarmScan();
+  };
   const unobserveHeavyElement = (element: Element) => {
-    blockObserver?.unobserve(element);
-    editorObserver?.unobserve(element);
+    observedBy.get(element)?.unobserve(element);
+    observedBy.delete(element);
     coldElements.delete(element);
   };
 
@@ -4245,9 +4271,7 @@ html [data-chatgpt-static-code-state="loading"] pre {
     if (!item || element.getAttribute(item.attribute) === "hot") return;
     if (element.hasAttribute(item.attribute)) {
       coldElements.add(element);
-      const observer = item.attribute === "data-chatgpt-rich-editor-state" ? editorObserver : blockObserver;
-      if (observer) observer.observe(element);
-      else scheduleWarmScan();
+      observeHeavyElement(item);
       return;
     }
     const size = intrinsicSizeFor(element);
@@ -4262,9 +4286,7 @@ html [data-chatgpt-static-code-state="loading"] pre {
     } else {
       incrementMetric("chatgptRichTextBlocksCold");
     }
-    const observer = item.attribute === "data-chatgpt-rich-editor-state" ? editorObserver : blockObserver;
-    if (observer) observer.observe(element);
-    else scheduleWarmScan();
+    observeHeavyElement(item);
   };
 
   const releaseRemovedElements = (node: Node) => {
@@ -4293,13 +4315,13 @@ html [data-chatgpt-static-code-state="loading"] pre {
 
   const root = pageWindow.document.documentElement;
   if (root) {
-    root.dataset.chatgptRichVisibilityStrategy = blockObserver && editorObserver ? "intersection" : "geometry-fallback";
+    root.dataset.chatgptRichVisibilityStrategy = viewportObservers.blocks && viewportObservers.editors ? "intersection" : "geometry-fallback";
     root.dataset.chatgptRichTextWarmDistancePx = String(effectiveWarmDistance);
     root.dataset.chatgptCodeEditorWarmDistancePx = String(
       effectiveEditorWarmDistance,
     );
     scanForHeavyElements(root);
-    if (!blockObserver || !editorObserver) {
+    if (!viewportObservers.blocks || !viewportObservers.editors) {
       pageWindow.addEventListener("scroll", scheduleWarmScan, { capture: true, passive: true });
       pageWindow.addEventListener("resize", scheduleWarmScan, { passive: true });
     }
@@ -4308,10 +4330,10 @@ html [data-chatgpt-static-code-state="loading"] pre {
         for (const removed of record.removedNodes) releaseRemovedElements(removed);
         for (const added of record.addedNodes) scanForHeavyElements(added);
       }
-      if (!blockObserver || !editorObserver) scheduleWarmScan();
+      if (!viewportObservers.blocks || !viewportObservers.editors) scheduleWarmScan();
     });
     mutationObserver.observe(root, { childList: true, subtree: true });
-    if (!blockObserver || !editorObserver) scheduleWarmScan();
+    if (!viewportObservers.blocks || !viewportObservers.editors) scheduleWarmScan();
   }
 }
 
