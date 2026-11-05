@@ -11,13 +11,14 @@ window.IntersectionObserver=class {
  constructor(callback,options){this.callback=callback;this.options=options;this.targets=new Set();window.__observers.push(this)}
  observe(target){this.targets.add(target)} unobserve(target){this.targets.delete(target)} disconnect(){this.targets.clear()} takeRecords(){return []}
 };
-</script><script src="/script.js"></script><main class="markdown" data-message-id="fixture"><div style="height:30000px"></div><div id="blocks"></div></main><pre id="result">PENDING</pre><script>
+</script><script src="/script.js"></script><main><div data-turn-key="fixture"><div data-markdown-text-style="default"><div style="height:30000px"></div><div id="blocks"></div><table id="modern-table"><tr><td>fixture</td></tr></table></div></div></main><pre id="result">PENDING</pre><script>
 (async()=>{try {
  const wait=ms=>new Promise(r=>setTimeout(r,ms));
  const blocks=document.querySelector('#blocks');
  for(let i=0;i<80;i++){const x=document.createElement('div');x.className='katex-display';x.style.height='120px';x.textContent='formula';blocks.append(x)}
  await wait(300);
- if(document.querySelectorAll('[data-chatgpt-rich-block-state=cold]').length!==80)throw Error('far blocks not cold');
+ if(document.querySelectorAll('[data-chatgpt-rich-block-state=cold]').length!==81)throw Error('far blocks not cold');
+ if(document.querySelector('#modern-table').getAttribute('data-chatgpt-rich-block-state')!=='cold')throw Error('modern ChatGPT table not detected');
  window.scrollTo(0,100);await wait(200);
  if(window.__rects!==0)throw Error('scroll queried block geometry '+window.__rects);
  const item=blocks.firstElementChild;

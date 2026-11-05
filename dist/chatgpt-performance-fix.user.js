@@ -3745,15 +3745,16 @@ html [data-chatgpt-static-code-state="loading"] pre {
     } catch (error) {
       console.warn(`[${SCRIPT_NAME}] Could not tune rich-text rendering`, error);
     }
-    const isConversationCodeEditor = (element) => Array.from(element.classList).some((name) => name.includes("_codemirror")) && Boolean(element.closest('[data-message-id], .markdown, [class*="MarkdownContent"], [class*="SmoothedMarkdown"]'));
+    const isConversationCodeEditor = (element) => Array.from(element.classList).some((name) => name.includes("_codemirror")) && Boolean(element.closest('[data-message-id], [data-turn-key], .markdown, [data-markdown-text-style], [class*="MarkdownContent"], [class*="SmoothedMarkdown"]'));
     const RICH_BLOCK_SELECTOR = [
       '[class*="SmoothedCodeBlock"]',
       ".markdown table",
+      "[data-markdown-text-style] table",
       '[class*="MarkdownContent"] table',
       ".katex-display",
       "[data-code-block-preview-pane]"
     ].join(",");
-    const isRichBlock = (element) => element.matches(RICH_BLOCK_SELECTOR) && Boolean(element.closest('[data-message-id], .markdown, [class*="MarkdownContent"], [class*="SmoothedMarkdown"]'));
+    const isRichBlock = (element) => element.matches(RICH_BLOCK_SELECTOR) && Boolean(element.closest('[data-message-id], [data-turn-key], .markdown, [data-markdown-text-style], [class*="MarkdownContent"], [class*="SmoothedMarkdown"]'));
     const intrinsicSizeFor = (element) => {
       if (Array.from(element.classList).some((name) => name.includes("SmoothedCodeBlock"))) {
         return 220;
@@ -3958,6 +3959,7 @@ html [data-chatgpt-static-code-state="loading"] pre {
     };
     const root = pageWindow.document.documentElement;
     if (root) {
+      root.dataset.chatgptRichVisibilityStrategy = blockObserver && editorObserver ? "intersection" : "geometry-fallback";
       root.dataset.chatgptRichTextWarmDistancePx = String(effectiveWarmDistance);
       root.dataset.chatgptCodeEditorWarmDistancePx = String(effectiveEditorWarmDistance);
       scanForHeavyElements(root);

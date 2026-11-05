@@ -4045,13 +4045,14 @@ html [data-chatgpt-static-code-state="loading"] pre {
     Array.from(element.classList).some((name) => name.includes("_codemirror")) &&
     Boolean(
       element.closest(
-        '[data-message-id], .markdown, [class*="MarkdownContent"], [class*="SmoothedMarkdown"]',
+        '[data-message-id], [data-turn-key], .markdown, [data-markdown-text-style], [class*="MarkdownContent"], [class*="SmoothedMarkdown"]',
       ),
     );
 
   const RICH_BLOCK_SELECTOR = [
     '[class*="SmoothedCodeBlock"]',
     '.markdown table',
+    '[data-markdown-text-style] table',
     '[class*="MarkdownContent"] table',
     '.katex-display',
     '[data-code-block-preview-pane]',
@@ -4061,7 +4062,7 @@ html [data-chatgpt-static-code-state="loading"] pre {
     element.matches(RICH_BLOCK_SELECTOR) &&
     Boolean(
       element.closest(
-        '[data-message-id], .markdown, [class*="MarkdownContent"], [class*="SmoothedMarkdown"]',
+        '[data-message-id], [data-turn-key], .markdown, [data-markdown-text-style], [class*="MarkdownContent"], [class*="SmoothedMarkdown"]',
       ),
     );
 
@@ -4292,6 +4293,7 @@ html [data-chatgpt-static-code-state="loading"] pre {
 
   const root = pageWindow.document.documentElement;
   if (root) {
+    root.dataset.chatgptRichVisibilityStrategy = blockObserver && editorObserver ? "intersection" : "geometry-fallback";
     root.dataset.chatgptRichTextWarmDistancePx = String(effectiveWarmDistance);
     root.dataset.chatgptCodeEditorWarmDistancePx = String(
       effectiveEditorWarmDistance,
