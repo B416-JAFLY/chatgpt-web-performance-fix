@@ -2277,7 +2277,29 @@ function installMessageMetadataDisplay(
     if (nestedRole === "user" || nestedRole === "assistant") return nestedRole;
     const turn = element.closest<HTMLElement>('[data-turn="user"], [data-turn="assistant"]');
     const turnRole = turn?.getAttribute("data-turn");
-    return turnRole === "user" || turnRole === "assistant" ? turnRole : null;
+    if (turnRole === "user" || turnRole === "assistant") return turnRole;
+
+    if (
+      element.matches('.group\\/user-message, [class*="group/user-message"]') ||
+      element.closest('.group\\/user-message, [class*="group/user-message"]') ||
+      element.matches('[data-chatgpt-search-unit-key*=":user"], [data-content-search-unit-key*=":user"]') ||
+      element.closest('[data-chatgpt-search-unit-key*=":user"], [data-content-search-unit-key*=":user"]')
+    ) {
+      return "user";
+    }
+
+    if (
+      element.matches('.agent-turn, [class*="agent-turn"]') ||
+      element.closest('.agent-turn, [class*="agent-turn"]') ||
+      element.matches('[data-chatgpt-search-unit-key*=":assistant"], [data-content-search-unit-key*=":assistant"]') ||
+      element.closest('[data-chatgpt-search-unit-key*=":assistant"], [data-content-search-unit-key*=":assistant"]') ||
+      element.matches('[data-chatgpt-selection-message-id]') ||
+      element.closest('[data-chatgpt-selection-message-id]')
+    ) {
+      return "assistant";
+    }
+
+    return null;
   };
 
   const renderRecord = (id: string): void => {
@@ -2370,20 +2392,39 @@ function installMessageMetadataDisplay(
       renderRecord(id);
       return;
     }
+    const searchIdsHost = candidate.hasAttribute("data-chatgpt-search-message-ids")
+      ? (candidate as HTMLElement)
+      : candidate.closest<HTMLElement>("[data-chatgpt-search-message-ids]") ??
+        candidate.querySelector<HTMLElement>("[data-chatgpt-search-message-ids]");
+    if (searchIdsHost) {
+      const rawIds = searchIdsHost.getAttribute("data-chatgpt-search-message-ids");
+      if (rawIds) {
+        const ids = rawIds.split(/[\s,]+/).filter(Boolean);
+        for (const id of ids) {
+          const elements = elementsById.get(id) ?? new Set<HTMLElement>();
+          elements.add(searchIdsHost);
+          elementsById.set(id, elements);
+          renderRecord(id);
+        }
+        if (ids.length > 0) return;
+      }
+    }
     const roleElement = candidate.matches("[data-message-author-role]")
-      ? candidate as HTMLElement
+      ? (candidate as HTMLElement)
       : candidate.closest<HTMLElement>("[data-message-author-role]") ??
         candidate.querySelector<HTMLElement>("[data-message-author-role]");
     const idElement = roleElement?.hasAttribute("data-message-id")
       ? roleElement
       : candidate.hasAttribute("data-message-id")
-        ? candidate as HTMLElement
+        ? (candidate as HTMLElement)
         : roleElement?.querySelector<HTMLElement>("[data-message-id]") ??
           candidate.closest<HTMLElement>("[data-message-id]") ??
           candidate.querySelector<HTMLElement>("[data-message-id]");
     const host = roleElement ?? idElement;
     const id = idElement?.getAttribute("data-message-id");
-    if (!host || !id || !roleForElement(host)) return;
+    if (!host || !id) return;
+    const role = roleForElement(host) ?? records.get(id)?.role;
+    if (!role) return;
     const elements = elementsById.get(id) ?? new Set<HTMLElement>();
     elements.add(host);
     elementsById.set(id, elements);
@@ -2392,11 +2433,11 @@ function installMessageMetadataDisplay(
 
   const scanRoot = (root: Element): void => {
     const candidates = new Set<Element>([root]);
-    const closest = root.closest("[data-message-author-role], [data-message-id], [data-chatgpt-selection-message-id]");
+    const selector =
+      "[data-message-author-role], [data-message-id], [data-chatgpt-selection-message-id], [data-chatgpt-search-message-ids], [data-chatgpt-search-unit-key], .group\\/user-message";
+    const closest = root.closest(selector);
     if (closest) candidates.add(closest);
-    for (const element of root.querySelectorAll(
-      "[data-message-author-role], [data-message-id], [data-chatgpt-selection-message-id]",
-    )) {
+    for (const element of root.querySelectorAll(selector)) {
       candidates.add(element);
     }
     for (const candidate of candidates) registerCandidate(candidate);
@@ -2668,14 +2709,24 @@ function installMessageMetadataDisplay(
       }
       for (const node of mutation.removedNodes) {
         if (!(node instanceof pageWindow.Element) || node.isConnected) continue;
-        const candidates = [node, ...node.querySelectorAll("[data-message-id], [data-chatgpt-selection-message-id]")];
+        const candidates = [
+          node,
+          ...node.querySelectorAll(
+            "[data-message-id], [data-chatgpt-selection-message-id], [data-chatgpt-search-message-ids]",
+          ),
+        ];
         for (const candidate of candidates) {
-          const id = candidate.getAttribute("data-message-id") ?? candidate.getAttribute("data-chatgpt-selection-message-id");
-          if (!id) continue;
-          const elements = elementsById.get(id);
-          if (!elements) continue;
-          for (const element of elements) if (!element.isConnected) elements.delete(element);
-          if (elements.size === 0) elementsById.delete(id);
+          const rawId =
+            candidate.getAttribute("data-message-id") ??
+            candidate.getAttribute("data-chatgpt-selection-message-id") ??
+            candidate.getAttribute("data-chatgpt-search-message-ids");
+          if (!rawId) continue;
+          for (const id of rawId.split(/[\s,]+/).filter(Boolean)) {
+            const elements = elementsById.get(id);
+            if (!elements) continue;
+            for (const element of elements) if (!element.isConnected) elements.delete(element);
+            if (elements.size === 0) elementsById.delete(id);
+          }
         }
       }
       for (const node of mutation.addedNodes) {
@@ -2685,7 +2736,14 @@ function installMessageMetadataDisplay(
   });
   observer.observe(pageWindow.document.documentElement, {
     attributes: true,
-    attributeFilter: ["data-message-id", "data-message-author-role", "data-turn", "data-chatgpt-selection-message-id"],
+    attributeFilter: [
+      "data-message-id",
+      "data-message-author-role",
+      "data-turn",
+      "data-chatgpt-selection-message-id",
+      "data-chatgpt-search-message-ids",
+      "data-chatgpt-search-unit-key",
+    ],
     childList: true,
     subtree: true,
   });
@@ -2756,16 +2814,46 @@ function installDeliveryVerifier(
     (pageWindow.document.head ?? pageWindow.document.documentElement).append(style);
   };
 
+  const escapeSelectorValue = (value: string) => {
+    return typeof CSS !== "undefined" && typeof CSS.escape === "function"
+      ? CSS.escape(value)
+      : value.replace(/["\\]/g, "\\$&");
+  };
+
   const findMessageElement = (probe: OutgoingMessageProbe): HTMLElement | null => {
-    const userMessages = [
+    if (probe.messageId) {
+      const byDirectId = pageWindow.document.querySelector<HTMLElement>(
+        `[data-message-id="${escapeSelectorValue(probe.messageId)}"]`,
+      );
+      if (byDirectId) {
+        return (
+          byDirectId.closest<HTMLElement>(
+            '[data-message-author-role="user"], [data-turn="user"], .group\\/user-message',
+          ) ?? byDirectId
+        );
+      }
+      const allWithSearchIds = pageWindow.document.querySelectorAll<HTMLElement>(
+        "[data-chatgpt-search-message-ids]",
+      );
+      for (const el of allWithSearchIds) {
+        const ids = el.getAttribute("data-chatgpt-search-message-ids")?.split(/[\s,]+/) ?? [];
+        if (ids.includes(probe.messageId)) return el;
+      }
+    }
+    const candidates = [
       ...pageWindow.document.querySelectorAll<HTMLElement>(
-        '[data-message-author-role="user"]',
+        '[data-message-author-role="user"], [data-turn="user"], .group\\/user-message, [data-chatgpt-search-unit-key*=":user"]',
       ),
     ];
+    const userMessages = candidates.filter(
+      (el) => !candidates.some((other) => other !== el && other.contains(el)),
+    );
     if (probe.messageId) {
-      const exact = userMessages.find(
-        (element) => element.getAttribute("data-message-id") === probe.messageId,
-      );
+      const exact = userMessages.find((el) => {
+        if (el.getAttribute("data-message-id") === probe.messageId) return true;
+        const ids = el.getAttribute("data-chatgpt-search-message-ids")?.split(/[\s,]+/) ?? [];
+        return ids.includes(probe.messageId!);
+      });
       if (exact) return exact;
     }
     if (!probe.text) return null;
@@ -2780,8 +2868,9 @@ function installDeliveryVerifier(
 
   const turnContainerFor = (message: HTMLElement): HTMLElement => {
     return (
-      message.closest<HTMLElement>('[data-turn="user"], [data-testid^="conversation-turn-"]') ??
-      message
+      message.closest<HTMLElement>(
+        '[data-turn="user"], [data-testid^="conversation-turn-"], [data-turn-key]',
+      ) ?? message
     );
   };
 
@@ -2868,7 +2957,7 @@ function installDeliveryVerifier(
     if (!message) return false;
     const anchor = turnContainerFor(message);
     const assistants = pageWindow.document.querySelectorAll<HTMLElement>(
-      '[data-turn="assistant"], .agent-turn, [data-message-author-role="assistant"]',
+      '[data-turn="assistant"], .agent-turn, [data-message-author-role="assistant"], [data-chatgpt-selection-message-id], [data-chatgpt-search-unit-key*=":assistant"]',
     );
     for (const assistant of assistants) {
       if (anchor.contains(assistant)) continue;
@@ -2921,7 +3010,12 @@ function installDeliveryVerifier(
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ["data-turn", "data-message-author-role"],
+      attributeFilter: [
+        "data-turn",
+        "data-message-author-role",
+        "data-chatgpt-search-message-ids",
+        "data-chatgpt-search-unit-key",
+      ],
     });
   }
 
