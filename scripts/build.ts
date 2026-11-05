@@ -1,6 +1,6 @@
 import { mkdirSync, rmSync } from "node:fs";
 
-const VERSION = "0.1.5";
+const VERSION = "0.1.6";
 
 const header = `// ==UserScript==
 // @name         ChatGPT Performance Fix (B416-JAFLY fork)
@@ -59,7 +59,40 @@ if (!result.success || result.outputs.length !== 1) {
 }
 
 const bundled = await result.outputs[0].text();
-await Bun.write("dist/chatgpt-performance-fix.user.js", `${header}\n${bundled}`);
+// Safari may run a userscript in an isolated world even with @sandbox raw.
+// Install in the page realm; a shared DOM acknowledgement proves execution.
+const loader = `(() => {
+  const doc = document;
+  if (doc.documentElement.dataset.chatgptPageRuntime === "ready") return;
+  const channel = "cgptperf-menu-" + Math.random().toString(36).slice(2);
+  doc.addEventListener(channel, event => {
+    const detail = event.detail;
+    if (typeof GM_registerMenuCommand === "function" && detail && typeof detail.label === "string") {
+      GM_registerMenuCommand(detail.label, () => doc.dispatchEvent(new CustomEvent(channel + "-" + detail.id)));
+    }
+  });
+  const runtime = '(function(){ const GM_registerMenuCommand = (label, callback) => { const id = Math.random().toString(36).slice(2); document.addEventListener(' + JSON.stringify(channel) + ' + "-" + id, callback); document.dispatchEvent(new CustomEvent(' + JSON.stringify(channel) + ', {detail:{label,id}})); };\\n' + ${JSON.stringify(bundled)} + '\\n})();';
+  let observer, timer, attempted = false;
+  const inject = () => {
+    if (attempted) return;
+    const nonce = doc.querySelector('script[nonce]')?.nonce;
+    if (!nonce && doc.readyState === "loading") return;
+    attempted = true;
+    observer?.disconnect(); clearTimeout(timer);
+    const script = doc.createElement("script");
+    if (nonce) script.nonce = nonce;
+    script.textContent = runtime;
+    (doc.head || doc.documentElement).append(script);
+    script.remove();
+    if (doc.documentElement.dataset.chatgptPageRuntime !== "ready") doc.documentElement.dataset.chatgptPageRuntime = "blocked";
+  };
+  observer = new MutationObserver(inject);
+  observer.observe(doc.documentElement, {childList:true,subtree:true});
+  doc.addEventListener("DOMContentLoaded", inject, {once:true});
+  timer = setTimeout(() => { inject(); observer.disconnect(); }, 3000);
+  inject();
+})();`;
+await Bun.write("dist/chatgpt-performance-fix.user.js", `${header}\n${loader}`);
 rmSync("dist/.build", { recursive: true, force: true });
 rmSync("dist/.worker", { recursive: true, force: true });
 

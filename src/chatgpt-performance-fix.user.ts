@@ -5181,7 +5181,9 @@ function install(pageWindow: Window & typeof globalThis): void {
       await waitForHistoryConsent(pageWindow, signal);
       pageWindow.document.documentElement.dataset.chatgptModernHistoryMode = "manual";
       // Preserve the native cursor, batch size and response on the new renderer.
-      return originalFetch(input, init);
+      const response = await originalFetch(input, init);
+      messageMetadataDisplay?.observeResponse(response);
+      return response;
     }
 
     let key: string;
@@ -5470,3 +5472,4 @@ function install(pageWindow: Window & typeof globalThis): void {
 const pageWindow =
   typeof unsafeWindow !== "undefined" && unsafeWindow ? unsafeWindow : window;
 install(pageWindow);
+pageWindow.document.documentElement.dataset.chatgptPageRuntime = "ready";
