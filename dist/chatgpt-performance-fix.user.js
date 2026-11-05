@@ -2,7 +2,7 @@
 // @name         ChatGPT Performance Fix (B416-JAFLY fork)
 // @name:zh-CN   ChatGPT 性能优化（B416-JAFLY fork）
 // @namespace    https://github.com/B416-JAFLY
-// @version      0.1.3
+// @version      0.1.4
 // @description  Improve ChatGPT performance on long conversations.
 // @description:zh-CN 改善 ChatGPT 长会话性能。
 // @author       canxin
@@ -2349,6 +2349,16 @@
         elementsById.delete(id);
     };
     const registerCandidate = (candidate) => {
+      if (candidate.hasAttribute("data-chatgpt-selection-message-id")) {
+        const id = candidate.getAttribute("data-chatgpt-selection-message-id");
+        if (!id)
+          return;
+        const elements = elementsById.get(id) ?? new Set;
+        elements.add(candidate);
+        elementsById.set(id, elements);
+        renderRecord(id);
+        return;
+      }
       const roleElement = candidate.matches("[data-message-author-role]") ? candidate : candidate.closest("[data-message-author-role]") ?? candidate.querySelector("[data-message-author-role]");
       const idElement = roleElement?.hasAttribute("data-message-id") ? roleElement : candidate.hasAttribute("data-message-id") ? candidate : roleElement?.querySelector("[data-message-id]") ?? candidate.closest("[data-message-id]") ?? candidate.querySelector("[data-message-id]");
       const host = roleElement ?? idElement;
@@ -2362,10 +2372,10 @@
     };
     const scanRoot = (root) => {
       const candidates = new Set([root]);
-      const closest = root.closest("[data-message-author-role], [data-message-id]");
+      const closest = root.closest("[data-message-author-role], [data-message-id], [data-chatgpt-selection-message-id]");
       if (closest)
         candidates.add(closest);
-      for (const element of root.querySelectorAll("[data-message-author-role], [data-message-id]")) {
+      for (const element of root.querySelectorAll("[data-message-author-role], [data-message-id], [data-chatgpt-selection-message-id]")) {
         candidates.add(element);
       }
       for (const candidate of candidates)
@@ -2610,9 +2620,9 @@
         for (const node of mutation.removedNodes) {
           if (!(node instanceof pageWindow.Element) || node.isConnected)
             continue;
-          const candidates = [node, ...node.querySelectorAll("[data-message-id]")];
+          const candidates = [node, ...node.querySelectorAll("[data-message-id], [data-chatgpt-selection-message-id]")];
           for (const candidate of candidates) {
-            const id = candidate.getAttribute("data-message-id");
+            const id = candidate.getAttribute("data-message-id") ?? candidate.getAttribute("data-chatgpt-selection-message-id");
             if (!id)
               continue;
             const elements = elementsById.get(id);
@@ -2633,7 +2643,7 @@
     });
     observer.observe(pageWindow.document.documentElement, {
       attributes: true,
-      attributeFilter: ["data-message-id", "data-message-author-role", "data-turn"],
+      attributeFilter: ["data-message-id", "data-message-author-role", "data-turn", "data-chatgpt-selection-message-id"],
       childList: true,
       subtree: true
     });
@@ -3293,6 +3303,7 @@ html [data-chatgpt-static-code-state="loading"] pre {
     const isConversationCodeEditor = (element) => Array.from(element.classList).some((name) => name.includes("_codemirror")) && Boolean(element.closest('[data-message-id], [data-turn-key], .markdown, [data-markdown-text-style], [class*="MarkdownContent"], [class*="SmoothedMarkdown"]'));
     const RICH_BLOCK_SELECTOR = [
       '[class*="SmoothedCodeBlock"]',
+      "[data-code-block]",
       ".markdown table",
       "[data-markdown-text-style] table",
       '[class*="MarkdownContent"] table',
@@ -3301,7 +3312,7 @@ html [data-chatgpt-static-code-state="loading"] pre {
     ].join(",");
     const isRichBlock = (element) => element.matches(RICH_BLOCK_SELECTOR) && Boolean(element.closest('[data-message-id], [data-turn-key], .markdown, [data-markdown-text-style], [class*="MarkdownContent"], [class*="SmoothedMarkdown"]'));
     const intrinsicSizeFor = (element) => {
-      if (Array.from(element.classList).some((name) => name.includes("SmoothedCodeBlock"))) {
+      if (element.hasAttribute("data-code-block") || Array.from(element.classList).some((name) => name.includes("SmoothedCodeBlock"))) {
         return 220;
       }
       if (element.matches("table"))

@@ -2360,6 +2360,15 @@ function installMessageMetadataDisplay(
   };
 
   const registerCandidate = (candidate: Element): void => {
+    if (candidate.hasAttribute("data-chatgpt-selection-message-id")) {
+      const id = candidate.getAttribute("data-chatgpt-selection-message-id");
+      if (!id) return;
+      const elements = elementsById.get(id) ?? new Set<HTMLElement>();
+      elements.add(candidate as HTMLElement);
+      elementsById.set(id, elements);
+      renderRecord(id);
+      return;
+    }
     const roleElement = candidate.matches("[data-message-author-role]")
       ? candidate as HTMLElement
       : candidate.closest<HTMLElement>("[data-message-author-role]") ??
@@ -2382,10 +2391,10 @@ function installMessageMetadataDisplay(
 
   const scanRoot = (root: Element): void => {
     const candidates = new Set<Element>([root]);
-    const closest = root.closest("[data-message-author-role], [data-message-id]");
+    const closest = root.closest("[data-message-author-role], [data-message-id], [data-chatgpt-selection-message-id]");
     if (closest) candidates.add(closest);
     for (const element of root.querySelectorAll(
-      "[data-message-author-role], [data-message-id]",
+      "[data-message-author-role], [data-message-id], [data-chatgpt-selection-message-id]",
     )) {
       candidates.add(element);
     }
@@ -2658,9 +2667,9 @@ function installMessageMetadataDisplay(
       }
       for (const node of mutation.removedNodes) {
         if (!(node instanceof pageWindow.Element) || node.isConnected) continue;
-        const candidates = [node, ...node.querySelectorAll("[data-message-id]")];
+        const candidates = [node, ...node.querySelectorAll("[data-message-id], [data-chatgpt-selection-message-id]")];
         for (const candidate of candidates) {
-          const id = candidate.getAttribute("data-message-id");
+          const id = candidate.getAttribute("data-message-id") ?? candidate.getAttribute("data-chatgpt-selection-message-id");
           if (!id) continue;
           const elements = elementsById.get(id);
           if (!elements) continue;
@@ -2675,7 +2684,7 @@ function installMessageMetadataDisplay(
   });
   observer.observe(pageWindow.document.documentElement, {
     attributes: true,
-    attributeFilter: ["data-message-id", "data-message-author-role", "data-turn"],
+    attributeFilter: ["data-message-id", "data-message-author-role", "data-turn", "data-chatgpt-selection-message-id"],
     childList: true,
     subtree: true,
   });
@@ -3487,6 +3496,7 @@ html [data-chatgpt-static-code-state="loading"] pre {
 
   const RICH_BLOCK_SELECTOR = [
     '[class*="SmoothedCodeBlock"]',
+    '[data-code-block]',
     '.markdown table',
     '[data-markdown-text-style] table',
     '[class*="MarkdownContent"] table',
@@ -3503,7 +3513,7 @@ html [data-chatgpt-static-code-state="loading"] pre {
     );
 
   const intrinsicSizeFor = (element: Element): number => {
-    if (Array.from(element.classList).some((name) => name.includes("SmoothedCodeBlock"))) {
+    if (element.hasAttribute("data-code-block") || Array.from(element.classList).some((name) => name.includes("SmoothedCodeBlock"))) {
       return 220;
     }
     if (element.matches('table')) return 240;
