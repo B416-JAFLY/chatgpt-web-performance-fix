@@ -19,7 +19,7 @@
     "test:rich-browser": "bun run build && bun run tests/rich-text-browser.ts",
     "test:safari": "bun run build && python3 tests/safari_mcp_runner.py"
   },
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Tampermonkey userscript for improving ChatGPT long-conversation performance.",
   "license": "MIT",
   "repository": {

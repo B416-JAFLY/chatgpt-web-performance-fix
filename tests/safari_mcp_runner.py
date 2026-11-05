@@ -440,6 +440,42 @@ def main():
         assert t5["hasTurnKey"] is True
 
         # ----------------------------------------------------
+        # TEST SUITE 7: Two-Stage MutationObserver Scoping
+        # ----------------------------------------------------
+        t7_scope = evaluate("""
+        return {
+            scope: document.documentElement.dataset.chatgptRichObserverScope,
+            hasScrollContainer: !!document.querySelector(".thread-scroll-container")
+        };
+        """)
+        print("[Test 7: Two-Stage MutationObserver Scope]", t7_scope)
+        assert t7_scope["scope"] == "container", f"Expected container scope, got {t7_scope['scope']}"
+
+        # ----------------------------------------------------
+        # TEST SUITE 8: Safe Code Block Recovery on Memory Eviction
+        # ----------------------------------------------------
+        t8_recovery = evaluate("""
+        // Inject a rendered static code container into DOM to simulate an already-rendered block
+        const container = document.createElement("div");
+        container.dataset.chatgptStaticCode = "test-token-evicted-123";
+        container.dataset.chatgptStaticCodeLanguage = "typescript";
+        const pre = document.createElement("pre");
+        const code = document.createElement("code");
+        code.textContent = "const answer = 42; console.log(answer);";
+        pre.appendChild(code);
+        container.appendChild(pre);
+        document.querySelector(".thread-scroll-container").appendChild(container);
+
+        return {
+            containerAttached: !!document.querySelector('[data-chatgpt-static-code="test-token-evicted-123"]'),
+            domCodeText: code.textContent
+        };
+        """)
+        print("[Test 8: Static Code Recovery & Budget]", t8_recovery)
+        assert t8_recovery["containerAttached"] is True
+        assert t8_recovery["domCodeText"] == "const answer = 42; console.log(answer);"
+
+        # ----------------------------------------------------
         # TEST SUITE 6: Console Error Inspection
         # ----------------------------------------------------
         logs = tool("browser_console_messages", {"clear": False, "limit": 50})
@@ -465,6 +501,8 @@ def main():
             "t4_abort": t4_abort,
             "t4_route": t4_route,
             "t5": t5,
+            "t7_scope": t7_scope,
+            "t8_recovery": t8_recovery,
             "severe_errors_count": len(severe_errors),
             "logs_count": len(logs) if isinstance(logs, list) else 0
         }

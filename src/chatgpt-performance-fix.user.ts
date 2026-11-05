@@ -14,6 +14,7 @@ import {
 } from "./optimizer";
 import { CacheBudget } from "./cache-budget";
 import { waitForHistoryConsent } from "./modern-history";
+import { ScopedContainerObserver, deduplicateAddedNodes } from "./scoped-observer";
 
 declare const unsafeWindow: (Window & typeof globalThis) | undefined;
 declare const GM_registerMenuCommand:
@@ -76,6 +77,17 @@ const RESPONSE_CACHE_BUDGET_BYTES = 16 * 1024 * 1024;
 const MAX_CONFIGURED_TURNS = 500;
 const ALL_INITIAL_FIRST_PAGE_TURNS = 32;
 const INTERNAL_RESPONSE_READS = new WeakSet<Response>();
+const sharedMemoryBudget = new CacheBudget(RESPONSE_CACHE_BUDGET_BYTES);
+
+function findConversationScrollContainer(
+  pageWindow: Window & typeof globalThis,
+): Element | null {
+  return (
+    pageWindow.document.querySelector(".thread-scroll-container") ??
+    pageWindow.document.querySelector('[class*="react-scroll-to-bottom"]') ??
+    pageWindow.document.querySelector("main")
+  );
+}
 
 function retryAfterBackoffMs(
   headers: Headers,
@@ -2448,10 +2460,28 @@ function staticCodeToken(anchor: HTMLAnchorElement): string | null {
 const STATIC_CODE_MARKER_RE =
   /\[代码块\]\(https:\/\/chatgpt\.com\/#cgptperf-code=([^&\s)]+)&lines=\d+\)/g;
 
-function restoreStaticCodeMarkdown(text: string): string {
+function restoreStaticCodeMarkdown(
+  text: string,
+  pageWindow?: Window & typeof globalThis,
+): string {
   if (!text.includes("#cgptperf-code=")) return text;
   return text.replace(STATIC_CODE_MARKER_RE, (full, token: string) => {
-    const block = staticCodeBlocks.get(token);
+    let block = staticCodeBlocks.get(token);
+    if (!block && pageWindow?.document) {
+      const container = pageWindow.document.querySelector<HTMLElement>(
+        `[data-chatgpt-static-code="${token}"]`,
+      );
+      if (container) {
+        const code = container.querySelector("code")?.textContent ?? "";
+        const language = container.dataset.chatgptStaticCodeLanguage ?? "";
+        block = {
+          token,
+          code,
+          language,
+          lineCount: code ? code.split("\n").length : 1,
+        };
+      }
+    }
     if (!block) return full;
     const fence = block.code.includes("```") ? "````" : "```";
     const language = block.language ? block.language : "";
@@ -2464,7 +2494,7 @@ function restoreStaticCodeTextarea(
   textarea: HTMLTextAreaElement,
 ): void {
   if (!textarea.value.includes("#cgptperf-code=")) return;
-  const restored = restoreStaticCodeMarkdown(textarea.value);
+  const restored = restoreStaticCodeMarkdown(textarea.value, pageWindow);
   if (restored === textarea.value) return;
   const setter = Object.getOwnPropertyDescriptor(
     pageWindow.HTMLTextAreaElement.prototype,
@@ -2480,11 +2510,14 @@ function restoreStaticCodeTextarea(
   );
 }
 
-function restoreStaticCodeRequestInit(init?: RequestInit): RequestInit | undefined {
+function restoreStaticCodeRequestInit(
+  init?: RequestInit,
+  pageWindow?: Window & typeof globalThis,
+): RequestInit | undefined {
   if (!init || typeof init.body !== "string" || !init.body.includes("#cgptperf-code=")) {
     return init;
   }
-  const body = restoreStaticCodeMarkdown(init.body);
+  const body = restoreStaticCodeMarkdown(init.body, pageWindow);
   return body === init.body ? init : { ...init, body };
 }
 
@@ -2502,6 +2535,7 @@ function hydrateStaticCodeAnchor(
   const collapsedHeight = Math.min(420, Math.max(92, block.lineCount * lineHeight + 44));
   const container = pageWindow.document.createElement("div");
   container.dataset.chatgptStaticCode = token;
+  container.dataset.chatgptStaticCodeLanguage = block.language || "";
   container.dataset.chatgptStaticCodeState = "loading";
   container.style.height = `${collapsedHeight}px`;
 
@@ -2528,7 +2562,8 @@ function hydrateStaticCodeAnchor(
   copy.disabled = true;
   copy.addEventListener("click", async () => {
     try {
-      await pageWindow.navigator.clipboard.writeText(block.code);
+      const codeToCopy = code.textContent || staticCodeBlocks.get(token)?.code || block.code;
+      await pageWindow.navigator.clipboard.writeText(codeToCopy);
       copy.textContent = "已复制";
       pageWindow.setTimeout(() => (copy.textContent = "复制"), 1_200);
     } catch {
@@ -2596,12 +2631,34 @@ function installStaticCodeHydrator(
   const root = pageWindow.document.documentElement;
   if (!root) return;
   scanStaticCodeMarkers(pageWindow, root);
-  const observer = new pageWindow.MutationObserver((records) => {
-    for (const record of records) {
-      for (const node of record.addedNodes) scanStaticCodeMarkers(pageWindow, node);
-    }
-  });
-  observer.observe(root, { childList: true, subtree: true });
+
+  // Global listener for textarea focus to restore any pasted/edited code markers outside the container
+  pageWindow.document.addEventListener(
+    "focusin",
+    (event) => {
+      if (event.target instanceof pageWindow.HTMLTextAreaElement) {
+        restoreStaticCodeTextarea(pageWindow, event.target);
+      }
+    },
+    { passive: true },
+  );
+
+  const scopedObserver = new ScopedContainerObserver(
+    pageWindow,
+    (records) => {
+      const addedElements = deduplicateAddedNodes(records);
+      for (const el of addedElements) {
+        scanStaticCodeMarkers(pageWindow, el);
+      }
+    },
+    () => findConversationScrollContainer(pageWindow),
+    (container) => {
+      if (container) {
+        scanStaticCodeMarkers(pageWindow, container);
+      }
+    },
+  );
+  scopedObserver.start();
 }
 
 function registerStaticCodeBlocks(
@@ -2609,11 +2666,19 @@ function registerStaticCodeBlocks(
   blocks: StaticCodeBlock[] | undefined,
 ): void {
   if (!blocks?.length) return;
-  for (const block of blocks) staticCodeBlocks.set(block.token, block);
-  while (staticCodeBlocks.size > 1_024) {
+  const convId = currentConversationId(pageWindow) ?? "global";
+  for (const block of blocks) {
+    staticCodeBlocks.set(block.token, block);
+    const codeBytes = 2 * (block.code.length + (block.language?.length ?? 0)) + 128;
+    sharedMemoryBudget.set(`staticCode:${convId}:${block.token}`, codeBytes, () => {
+      staticCodeBlocks.delete(block.token);
+    });
+  }
+  while (staticCodeBlocks.size > 2_048) {
     const oldest = staticCodeBlocks.keys().next().value;
     if (typeof oldest !== "string") break;
     staticCodeBlocks.delete(oldest);
+    sharedMemoryBudget.delete(`staticCode:${convId}:${oldest}`);
   }
   installStaticCodeHydrator(pageWindow);
   scanStaticCodeMarkers(pageWindow, pageWindow.document.documentElement);
@@ -3184,14 +3249,31 @@ html [data-chatgpt-static-code-state="loading"] pre {
       pageWindow.addEventListener("scroll", scheduleWarmScan, { capture: true, passive: true });
       pageWindow.addEventListener("resize", scheduleWarmScan, { passive: true });
     }
-    const mutationObserver = new pageWindow.MutationObserver((records) => {
-      for (const record of records) {
-        for (const removed of record.removedNodes) releaseRemovedElements(removed);
-        for (const added of record.addedNodes) scanForHeavyElements(added);
-      }
-      if (!viewportObservers.blocks || !viewportObservers.editors) scheduleWarmScan();
-    });
-    mutationObserver.observe(root, { childList: true, subtree: true });
+    const scopedObserver = new ScopedContainerObserver(
+      pageWindow,
+      (records) => {
+        for (const record of records) {
+          for (let i = 0; i < record.removedNodes.length; i++) {
+            releaseRemovedElements(record.removedNodes[i]);
+          }
+        }
+        const addedElements = deduplicateAddedNodes(records);
+        for (const added of addedElements) scanForHeavyElements(added);
+        if (!viewportObservers.blocks || !viewportObservers.editors) scheduleWarmScan();
+      },
+      () => findConversationScrollContainer(pageWindow),
+      (container) => {
+        const docRoot = pageWindow.document.documentElement;
+        if (docRoot) {
+          docRoot.dataset.chatgptRichObserverScope = container ? "container" : "global";
+        }
+        if (container) {
+          scanForHeavyElements(container);
+          if (!viewportObservers.blocks || !viewportObservers.editors) scheduleWarmScan();
+        }
+      },
+    );
+    scopedObserver.start();
     if (!viewportObservers.blocks || !viewportObservers.editors) scheduleWarmScan();
   }
 }
@@ -3386,6 +3468,7 @@ function installLegacyResponseFallback(
       const cached = byUrl.get(response.url);
       if (cached?.fingerprint === fingerprint) {
         incrementMetric("chatgptLegacyFallbackCacheHits");
+        sharedMemoryBudget.touch(`byUrl:${response.url}`);
         return cached;
       }
 
@@ -3417,10 +3500,16 @@ function installLegacyResponseFallback(
 
       const value = { body, payload: parsed, fingerprint, stats };
       byUrl.set(response.url, value);
+      const estimatedBytes =
+        2 * value.body.length + (value.payload ? 4 * value.body.length : 0);
+      sharedMemoryBudget.set(`byUrl:${response.url}`, estimatedBytes, () => {
+        byUrl.delete(response.url);
+      });
       while (byUrl.size > 8) {
         const oldest = byUrl.keys().next().value;
         if (typeof oldest !== "string") break;
         byUrl.delete(oldest);
+        sharedMemoryBudget.delete(`byUrl:${oldest}`);
       }
       return value;
     })();
@@ -3462,6 +3551,7 @@ function installLegacyResponseFallback(
   const controller = {
     clear: () => {
       byUrl.clear();
+      sharedMemoryBudget.deleteMatching((key) => key.startsWith("byUrl:"));
     },
   };
   Reflect.set(pageWindow, marker, controller);
@@ -4234,7 +4324,7 @@ function install(pageWindow: Window & typeof globalThis): void {
   // initial response for this page session so those fetches are local reads.
   // Active responses must pass through until the server reports completion.
   const initialSnapshots = new Map<string, InitialConversationSnapshot>();
-  const responseBudget = new CacheBudget(RESPONSE_CACHE_BUDGET_BYTES);
+  const responseBudget = sharedMemoryBudget;
   const responseBytes = (response: MaterializedResponse): number =>
     2 * (response.body.length + response.url.length + response.statusText.length +
       response.headers.reduce((sum, [name, value]) => sum + name.length + value.length, 0)) +
@@ -4287,8 +4377,16 @@ function install(pageWindow: Window & typeof globalThis): void {
         conversationId,
         (initialSnapshotEpochs.get(conversationId) ?? 0) + 1,
       );
+      sharedMemoryBudget.deleteMatching((key) =>
+        key.startsWith(`localPage:${conversationId}:`) ||
+        key.startsWith(`staticCode:${conversationId}:`),
+      );
     } else {
       globalInitialSnapshotEpoch += 1;
+      sharedMemoryBudget.deleteMatching((key) =>
+        key.startsWith("localPage:") ||
+        key.startsWith("byUrl:"),
+      );
     }
 
     for (const [key, snapshot] of initialSnapshots) {
@@ -4303,6 +4401,23 @@ function install(pageWindow: Window & typeof globalThis): void {
       Number(root.dataset.chatgptInitialSnapshotInvalidations ?? "0") + 1,
     );
   };
+
+  let lastKnownConvId = currentConversationId(pageWindow);
+  const checkConversationSwitch = () => {
+    const currentId = currentConversationId(pageWindow);
+    if (currentId && currentId !== lastKnownConvId) {
+      const prevId = lastKnownConvId;
+      lastKnownConvId = currentId;
+      if (prevId) {
+        sharedMemoryBudget.deleteMatching((key) =>
+          key.startsWith(`localPage:${prevId}:`) ||
+          key.startsWith(`staticCode:${prevId}:`),
+        );
+      }
+    }
+  };
+  pageWindow.addEventListener("popstate", checkConversationSwitch, { passive: true });
+  pageWindow.setInterval(checkConversationSwitch, 1000);
 
   const readInitialSnapshot = (
     key: string,
@@ -4531,6 +4646,7 @@ function install(pageWindow: Window & typeof globalThis): void {
       const before = requestUrlObject.searchParams.get("before");
       const localPage = before == null ? undefined : localPages.get(before);
       if (localPage) {
+        responseBudget.touch(`localPage:${apiMatch.conversationId ?? ""}:${before}`);
         await yieldUntilInteractionIdle(pageWindow);
         const cloned = cloneMaterializedResponse(pageWindow, {
           ...localPage,
@@ -4731,11 +4847,17 @@ function install(pageWindow: Window & typeof globalThis): void {
       }
       for (const localPage of materialized.localPages ?? []) {
         localPages.set(localPage.cursor, localPage.response);
+        const cursorKey = `localPage:${apiMatch?.conversationId ?? ""}:${localPage.cursor}`;
+        const pageBytes = responseBytes(localPage.response);
+        responseBudget.set(cursorKey, pageBytes, () => {
+          localPages.delete(localPage.cursor);
+        });
       }
       while (localPages.size > 256) {
         const oldest = localPages.keys().next().value;
         if (typeof oldest !== "string") break;
         localPages.delete(oldest);
+        responseBudget.delete(`localPage:${apiMatch?.conversationId ?? ""}:${oldest}`);
       }
 
       if (
