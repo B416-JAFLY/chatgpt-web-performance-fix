@@ -603,6 +603,41 @@
     return false;
   }
 
+  // src/cache-budget.ts
+  class CacheBudget {
+    limit;
+    entries = new Map;
+    total = 0;
+    constructor(limit) {
+      this.limit = limit;
+    }
+    delete(key) {
+      const entry = this.entries.get(key);
+      if (!entry)
+        return;
+      this.total -= entry.bytes;
+      this.entries.delete(key);
+    }
+    touch(key) {
+      const entry = this.entries.get(key);
+      if (!entry)
+        return;
+      this.entries.delete(key);
+      this.entries.set(key, entry);
+    }
+    set(key, bytes, evict) {
+      this.delete(key);
+      this.entries.set(key, { bytes, evict });
+      this.total += bytes;
+      while (this.total > this.limit && this.entries.size) {
+        const oldest = this.entries.keys().next().value;
+        const entry = this.entries.get(oldest);
+        this.delete(oldest);
+        entry.evict();
+      }
+    }
+  }
+
   // src/chatgpt-performance-fix.user.ts
   var SCRIPT_NAME = "ChatGPT Long Conversation Performance Fix";
   var SETTINGS_KEY = "chatgpt-performance-fix:settings:v1";
@@ -612,6 +647,7 @@
   var SIDEBAR_RATE_LIMIT_BACKOFF_MS = 2 * 60000;
   var INITIAL_RATE_LIMIT_BACKOFF_MS = 2 * 60000;
   var MAX_INITIAL_CONVERSATION_SNAPSHOTS = 32;
+  var RESPONSE_CACHE_BUDGET_BYTES = 16 * 1024 * 1024;
   var MAX_CONFIGURED_TURNS = 500;
   var ALL_INITIAL_FIRST_PAGE_TURNS = 32;
   var INTERNAL_RESPONSE_READS = new WeakSet;
@@ -3026,6 +3062,24 @@
           }
           continue;
         }
+        for (const node of mutation.removedNodes) {
+          if (!(node instanceof pageWindow.Element) || node.isConnected)
+            continue;
+          const candidates = [node, ...node.querySelectorAll("[data-message-id]")];
+          for (const candidate of candidates) {
+            const id = candidate.getAttribute("data-message-id");
+            if (!id)
+              continue;
+            const elements = elementsById.get(id);
+            if (!elements)
+              continue;
+            for (const element of elements)
+              if (!element.isConnected)
+                elements.delete(element);
+            if (elements.size === 0)
+              elementsById.delete(id);
+          }
+        }
         for (const node of mutation.addedNodes) {
           if (node instanceof pageWindow.Element)
             scheduleScan(node);
@@ -3723,14 +3777,17 @@ html [data-chatgpt-static-code-state="loading"] pre {
       root.dataset[name] = String(current + 1);
     };
     const activate = (item) => {
+      queued.delete(item.element);
       if (!item.element.isConnected) {
-        coldElements.delete(item.element);
+        unobserveHeavyElement(item.element);
         return;
       }
-      if (item.element.getAttribute(item.attribute) === "hot")
+      if (item.element.getAttribute(item.attribute) === "hot") {
+        unobserveHeavyElement(item.element);
         return;
+      }
       item.element.setAttribute(item.attribute, "hot");
-      coldElements.delete(item.element);
+      unobserveHeavyElement(item.element);
       incrementMetric(item.metric);
     };
     const drainActivationQueue = () => {
@@ -3789,6 +3846,33 @@ html [data-chatgpt-static-code-state="loading"] pre {
     };
     const effectiveWarmDistance = Math.max(1500, Math.floor(warmDistancePx));
     const effectiveEditorWarmDistance = Math.max(800, Math.floor(editorWarmDistancePx));
+    const NativeIntersectionObserver = pageWindow.IntersectionObserver;
+    const makeWarmObserver = (distance) => {
+      if (typeof NativeIntersectionObserver !== "function")
+        return null;
+      return new NativeIntersectionObserver((entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting || !entry.target.isConnected)
+            continue;
+          const item = activationFor(entry.target);
+          if (!item)
+            continue;
+          const rect = entry.boundingClientRect;
+          const visible = rect.bottom >= 0 && rect.top <= pageWindow.innerHeight;
+          if (visible)
+            activate(item);
+          else
+            enqueueActivation(item, rect.top > pageWindow.innerHeight ? rect.top - pageWindow.innerHeight : Math.max(0, -rect.bottom));
+        }
+      }, { rootMargin: `${distance}px 0px` });
+    };
+    const blockObserver = makeWarmObserver(effectiveWarmDistance);
+    const editorObserver = makeWarmObserver(effectiveEditorWarmDistance);
+    const unobserveHeavyElement = (element) => {
+      blockObserver?.unobserve(element);
+      editorObserver?.unobserve(element);
+      coldElements.delete(element);
+    };
     const scanWarmDistance = () => {
       warmScanFrame = null;
       for (const element of [...coldElements]) {
@@ -3822,8 +3906,17 @@ html [data-chatgpt-static-code-state="loading"] pre {
     };
     const registerHeavyElement = (element) => {
       const item = activationFor(element);
-      if (!item || element.hasAttribute(item.attribute))
+      if (!item || element.getAttribute(item.attribute) === "hot")
         return;
+      if (element.hasAttribute(item.attribute)) {
+        coldElements.add(element);
+        const observer = item.attribute === "data-chatgpt-rich-editor-state" ? editorObserver : blockObserver;
+        if (observer)
+          observer.observe(element);
+        else
+          scheduleWarmScan();
+        return;
+      }
       const size = intrinsicSizeFor(element);
       element.style.setProperty("--chatgpt-rich-intrinsic-size", `${size}px`);
       element.setAttribute(item.attribute, "cold");
@@ -3833,7 +3926,27 @@ html [data-chatgpt-static-code-state="loading"] pre {
       } else {
         incrementMetric("chatgptRichTextBlocksCold");
       }
-      scheduleWarmScan();
+      const observer = item.attribute === "data-chatgpt-rich-editor-state" ? editorObserver : blockObserver;
+      if (observer)
+        observer.observe(element);
+      else
+        scheduleWarmScan();
+    };
+    const releaseRemovedElements = (node) => {
+      if (!(node instanceof pageWindow.Element) || node.isConnected)
+        return;
+      const selector = '[data-chatgpt-rich-editor-state="cold"], [data-chatgpt-rich-block-state="cold"]';
+      const removed = [node, ...node.querySelectorAll(selector)];
+      for (const element of removed) {
+        if (!coldElements.has(element) || element.isConnected)
+          continue;
+        unobserveHeavyElement(element);
+        queued.delete(element);
+      }
+      for (let index = activationQueue.length - 1;index >= 0; index -= 1) {
+        if (!activationQueue[index].element.isConnected)
+          activationQueue.splice(index, 1);
+      }
     };
     const scanForHeavyElements = (node) => {
       if (!(node instanceof pageWindow.Element))
@@ -3848,20 +3961,23 @@ html [data-chatgpt-static-code-state="loading"] pre {
       root.dataset.chatgptRichTextWarmDistancePx = String(effectiveWarmDistance);
       root.dataset.chatgptCodeEditorWarmDistancePx = String(effectiveEditorWarmDistance);
       scanForHeavyElements(root);
-      pageWindow.addEventListener("scroll", scheduleWarmScan, {
-        capture: true,
-        passive: true
-      });
-      pageWindow.addEventListener("resize", scheduleWarmScan, { passive: true });
+      if (!blockObserver || !editorObserver) {
+        pageWindow.addEventListener("scroll", scheduleWarmScan, { capture: true, passive: true });
+        pageWindow.addEventListener("resize", scheduleWarmScan, { passive: true });
+      }
       const mutationObserver = new pageWindow.MutationObserver((records) => {
         for (const record of records) {
+          for (const removed of record.removedNodes)
+            releaseRemovedElements(removed);
           for (const added of record.addedNodes)
             scanForHeavyElements(added);
         }
-        scheduleWarmScan();
+        if (!blockObserver || !editorObserver)
+          scheduleWarmScan();
       });
       mutationObserver.observe(root, { childList: true, subtree: true });
-      scheduleWarmScan();
+      if (!blockObserver || !editorObserver)
+        scheduleWarmScan();
     }
   }
   function showOptimizationToast(pageWindow, message, onLoadFull) {
@@ -4509,6 +4625,34 @@ html [data-chatgpt-static-code-state="loading"] pre {
     const deliveryVerifier = installDeliveryVerifier(pageWindow);
     const cache = new Map;
     const initialSnapshots = new Map;
+    const responseBudget = new CacheBudget(RESPONSE_CACHE_BUDGET_BYTES);
+    const responseBytes = (response) => 2 * (response.body.length + response.url.length + response.statusText.length + response.headers.reduce((sum, [name, value]) => sum + name.length + value.length, 0)) + (response.localPages ?? []).reduce((sum, page) => sum + 2 * page.cursor.length + responseBytes(page.response), 0);
+    let cacheCleanupTimer;
+    let cacheCleanupAt = Infinity;
+    const scheduleCacheCleanup = () => {
+      if (cache.size === 0)
+        return;
+      let next = Infinity;
+      for (const value of cache.values())
+        next = Math.min(next, value.expiresAt);
+      if (cacheCleanupTimer != null && cacheCleanupAt <= next)
+        return;
+      if (cacheCleanupTimer != null)
+        pageWindow.clearTimeout(cacheCleanupTimer);
+      cacheCleanupAt = next;
+      cacheCleanupTimer = pageWindow.setTimeout(() => {
+        cacheCleanupTimer = undefined;
+        cacheCleanupAt = Infinity;
+        const now = Date.now();
+        for (const [key, value] of cache) {
+          if (value.expiresAt > now)
+            continue;
+          cache.delete(key);
+          responseBudget.delete(`history:${key}`);
+        }
+        scheduleCacheCleanup();
+      }, Math.max(0, next - Date.now()));
+    };
     const initialSnapshotEpochs = new Map;
     const asyncStatusActivity = new Map;
     let globalInitialSnapshotEpoch = 0;
@@ -4531,6 +4675,7 @@ html [data-chatgpt-static-code-state="loading"] pre {
           continue;
         if (!conversationId || key.includes(`:${conversationId}:`)) {
           initialSnapshots.delete(key);
+          responseBudget.delete(`snapshot:${key}`);
         }
       }
       const root = pageWindow.document.documentElement;
@@ -4542,10 +4687,12 @@ html [data-chatgpt-static-code-state="loading"] pre {
         return null;
       if (snapshot.expiresAt <= Date.now()) {
         initialSnapshots.delete(key);
+        responseBudget.delete(`snapshot:${key}`);
         return null;
       }
       initialSnapshots.delete(key);
       initialSnapshots.set(key, snapshot);
+      responseBudget.touch(`snapshot:${key}`);
       const root = pageWindow.document.documentElement;
       root.dataset.chatgptInitialSnapshotHits = String(Number(root.dataset.chatgptInitialSnapshotHits ?? "0") + 1);
       if (snapshot.rateLimited) {
@@ -4570,8 +4717,10 @@ html [data-chatgpt-static-code-state="loading"] pre {
       }
       if (successful && (response.activeConversation !== false || !epochIsCurrent)) {
         const existing = initialSnapshots.get(key);
-        if (existing && !existing.rateLimited)
+        if (existing && !existing.rateLimited) {
           initialSnapshots.delete(key);
+          responseBudget.delete(`snapshot:${key}`);
+        }
         const root = pageWindow.document.documentElement;
         const reason = response.activeConversation === true ? "Active" : "StaleOrUnknown";
         const datasetKey = `chatgptInitialSnapshotSkipped${reason}`;
@@ -4581,12 +4730,17 @@ html [data-chatgpt-static-code-state="loading"] pre {
       const now = Date.now();
       const expiresAt = rateLimited ? now + retryAfterBackoffMs(new pageWindow.Headers(response.headers), INITIAL_RATE_LIMIT_BACKOFF_MS, now) : Number.POSITIVE_INFINITY;
       initialSnapshots.delete(key);
+      responseBudget.delete(`snapshot:${key}`);
       initialSnapshots.set(key, { response, expiresAt, rateLimited });
+      if (!rateLimited) {
+        responseBudget.set(`snapshot:${key}`, responseBytes(response), () => initialSnapshots.delete(key));
+      }
       while (initialSnapshots.size > MAX_INITIAL_CONVERSATION_SNAPSHOTS) {
         const oldest = initialSnapshots.keys().next().value;
         if (typeof oldest !== "string")
           break;
         initialSnapshots.delete(oldest);
+        responseBudget.delete(`snapshot:${oldest}`);
       }
       const root = pageWindow.document.documentElement;
       root.dataset.chatgptInitialSnapshotsStored = String(Number(root.dataset.chatgptInitialSnapshotsStored ?? "0") + 1);
@@ -4596,7 +4750,13 @@ html [data-chatgpt-static-code-state="loading"] pre {
     };
     const clearLiveConversationCache = (conversationId) => {
       invalidateInitialSnapshots(conversationId);
+      for (const key of cache.keys())
+        responseBudget.delete(`history:${key}`);
       cache.clear();
+      if (cacheCleanupTimer != null)
+        pageWindow.clearTimeout(cacheCleanupTimer);
+      cacheCleanupTimer = undefined;
+      cacheCleanupAt = Infinity;
       inFlight.clear();
       responseFallback.clear();
     };
@@ -4748,6 +4908,7 @@ html [data-chatgpt-static-code-state="loading"] pre {
           key = `paginated:${rewrittenUrl}`;
           const cached = cache.get(key);
           if (cached && cached.expiresAt > Date.now()) {
+            responseBudget.touch(`history:${key}`);
             const root = pageWindow.document.documentElement;
             const hits = Number(root.dataset.chatgptHistoryCacheHits ?? "0");
             root.dataset.chatgptHistoryCacheHits = String(hits + 1);
@@ -4763,8 +4924,10 @@ html [data-chatgpt-static-code-state="loading"] pre {
             dispatchHistorySettledAfterCommit(pageWindow);
             return cloned;
           }
-          if (cached)
+          if (cached) {
             cache.delete(key);
+            responseBudget.delete(`history:${key}`);
+          }
         }
         task = inFlight.get(key);
         if (!task) {
@@ -4799,12 +4962,16 @@ html [data-chatgpt-static-code-state="loading"] pre {
             expiresAt: Date.now() + HISTORY_CACHE_TTL_MS,
             response: materialized
           });
+          responseBudget.set(`history:${key}`, responseBytes(materialized), () => cache.delete(key));
+          scheduleCacheCleanup();
         }
         if ((materialized.apiKind === "legacy-full" || materialized.lazyInitial) && materialized.optimized && materialized.cacheable) {
           cache.set(key, {
             expiresAt: Date.now() + CACHE_TTL_MS,
             response: materialized
           });
+          responseBudget.set(`history:${key}`, responseBytes(materialized), () => cache.delete(key));
+          scheduleCacheCleanup();
         }
         if (materialized.optimized) {
           const stats = materialized.stats;

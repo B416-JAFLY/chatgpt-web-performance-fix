@@ -2,6 +2,8 @@
 
 > 此分支是 B416-JAFLY 的实验性 fork，减少流式回复期间无关页面变动造成的侧栏扫描。[安装此分支的脚本](https://raw.githubusercontent.com/B416-JAFLY/chatgpt-web-performance-fix/improve/observer-overhead/dist/chatgpt-performance-fix.user.js)。安装前请在 Tampermonkey 中停用原版，避免两个脚本同时运行；此 fork 使用独立名称和命名空间，设置需要重新选择。
 
+此分支使用 IntersectionObserver 预热富文本，移除冷元素时停止观察；支持保留的成功会话快照与可重建的历史响应共享约 16 MiB 的字符串预算，并按最近使用情况淘汰。估算值不是 JavaScript 堆的实际占用；仍供合成游标使用的本地分页和静态代码数据不包含在预算内。原有 429 退避记录单独保留。浏览器回归测试可运行 `bun run test:rich-browser`，不需要私有会话采样数据。
+
 用于改善 ChatGPT 长会话性能和滚动体验的 Tampermonkey 用户脚本。
 
 ## 功能

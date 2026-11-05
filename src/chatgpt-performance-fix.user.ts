@@ -13,6 +13,7 @@ import {
   type PaginatedOptimizationStats,
 } from "./optimizer";
 import { sidebarMayHaveChanged } from "./sidebar-mutations";
+import { CacheBudget } from "./cache-budget";
 
 declare const unsafeWindow: (Window & typeof globalThis) | undefined;
 declare const GM_registerMenuCommand:
@@ -74,6 +75,7 @@ const HISTORY_CACHE_TTL_MS = 5 * 60_000;
 const SIDEBAR_RATE_LIMIT_BACKOFF_MS = 2 * 60_000;
 const INITIAL_RATE_LIMIT_BACKOFF_MS = 2 * 60_000;
 const MAX_INITIAL_CONVERSATION_SNAPSHOTS = 32;
+const RESPONSE_CACHE_BUDGET_BYTES = 16 * 1024 * 1024;
 const MAX_CONFIGURED_TURNS = 500;
 const ALL_INITIAL_FIRST_PAGE_TURNS = 32;
 const INTERNAL_RESPONSE_READS = new WeakSet<Response>();
@@ -3218,6 +3220,18 @@ function installMessageMetadataDisplay(
         }
         continue;
       }
+      for (const node of mutation.removedNodes) {
+        if (!(node instanceof pageWindow.Element) || node.isConnected) continue;
+        const candidates = [node, ...node.querySelectorAll("[data-message-id]")];
+        for (const candidate of candidates) {
+          const id = candidate.getAttribute("data-message-id");
+          if (!id) continue;
+          const elements = elementsById.get(id);
+          if (!elements) continue;
+          for (const element of elements) if (!element.isConnected) elements.delete(element);
+          if (elements.size === 0) elementsById.delete(id);
+        }
+      }
       for (const node of mutation.addedNodes) {
         if (node instanceof pageWindow.Element) scheduleScan(node);
       }
@@ -4081,13 +4095,17 @@ html [data-chatgpt-static-code-state="loading"] pre {
   };
 
   const activate = (item: RichActivation): void => {
+    queued.delete(item.element);
     if (!item.element.isConnected) {
-      coldElements.delete(item.element);
+      unobserveHeavyElement(item.element);
       return;
     }
-    if (item.element.getAttribute(item.attribute) === "hot") return;
+    if (item.element.getAttribute(item.attribute) === "hot") {
+      unobserveHeavyElement(item.element);
+      return;
+    }
     item.element.setAttribute(item.attribute, "hot");
-    coldElements.delete(item.element);
+    unobserveHeavyElement(item.element);
     incrementMetric(item.metric);
   };
 
@@ -4153,6 +4171,33 @@ html [data-chatgpt-static-code-state="loading"] pre {
     Math.floor(editorWarmDistancePx),
   );
 
+  // Capture the native constructor before the pagination hook is installed.
+  // The hook deliberately suppresses pagination sentinels and must not be
+  // involved in observing rich-text blocks.
+  const NativeIntersectionObserver = pageWindow.IntersectionObserver;
+  const makeWarmObserver = (distance: number): IntersectionObserver | null => {
+    if (typeof NativeIntersectionObserver !== "function") return null;
+    return new NativeIntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting || !entry.target.isConnected) continue;
+        const item = activationFor(entry.target);
+        if (!item) continue;
+        const rect = entry.boundingClientRect;
+        const visible = rect.bottom >= 0 && rect.top <= pageWindow.innerHeight;
+        if (visible) activate(item);
+        else enqueueActivation(item, rect.top > pageWindow.innerHeight
+          ? rect.top - pageWindow.innerHeight : Math.max(0, -rect.bottom));
+      }
+    }, { rootMargin: `${distance}px 0px` });
+  };
+  const blockObserver = makeWarmObserver(effectiveWarmDistance);
+  const editorObserver = makeWarmObserver(effectiveEditorWarmDistance);
+  const unobserveHeavyElement = (element: Element) => {
+    blockObserver?.unobserve(element);
+    editorObserver?.unobserve(element);
+    coldElements.delete(element);
+  };
+
   const scanWarmDistance = () => {
     warmScanFrame = null;
     for (const element of [...coldElements]) {
@@ -4196,7 +4241,14 @@ html [data-chatgpt-static-code-state="loading"] pre {
 
   const registerHeavyElement = (element: Element) => {
     const item = activationFor(element);
-    if (!item || element.hasAttribute(item.attribute)) return;
+    if (!item || element.getAttribute(item.attribute) === "hot") return;
+    if (element.hasAttribute(item.attribute)) {
+      coldElements.add(element);
+      const observer = item.attribute === "data-chatgpt-rich-editor-state" ? editorObserver : blockObserver;
+      if (observer) observer.observe(element);
+      else scheduleWarmScan();
+      return;
+    }
     const size = intrinsicSizeFor(element);
     (element as HTMLElement).style.setProperty(
       "--chatgpt-rich-intrinsic-size",
@@ -4209,7 +4261,23 @@ html [data-chatgpt-static-code-state="loading"] pre {
     } else {
       incrementMetric("chatgptRichTextBlocksCold");
     }
-    scheduleWarmScan();
+    const observer = item.attribute === "data-chatgpt-rich-editor-state" ? editorObserver : blockObserver;
+    if (observer) observer.observe(element);
+    else scheduleWarmScan();
+  };
+
+  const releaseRemovedElements = (node: Node) => {
+    if (!(node instanceof pageWindow.Element) || node.isConnected) return;
+    const selector = '[data-chatgpt-rich-editor-state="cold"], [data-chatgpt-rich-block-state="cold"]';
+    const removed = [node, ...node.querySelectorAll(selector)];
+    for (const element of removed) {
+      if (!coldElements.has(element) || element.isConnected) continue;
+      unobserveHeavyElement(element);
+      queued.delete(element);
+    }
+    for (let index = activationQueue.length - 1; index >= 0; index -= 1) {
+      if (!activationQueue[index].element.isConnected) activationQueue.splice(index, 1);
+    }
   };
 
   const scanForHeavyElements = (node: Node) => {
@@ -4229,19 +4297,19 @@ html [data-chatgpt-static-code-state="loading"] pre {
       effectiveEditorWarmDistance,
     );
     scanForHeavyElements(root);
-    pageWindow.addEventListener("scroll", scheduleWarmScan, {
-      capture: true,
-      passive: true,
-    });
-    pageWindow.addEventListener("resize", scheduleWarmScan, { passive: true });
+    if (!blockObserver || !editorObserver) {
+      pageWindow.addEventListener("scroll", scheduleWarmScan, { capture: true, passive: true });
+      pageWindow.addEventListener("resize", scheduleWarmScan, { passive: true });
+    }
     const mutationObserver = new pageWindow.MutationObserver((records) => {
       for (const record of records) {
+        for (const removed of record.removedNodes) releaseRemovedElements(removed);
         for (const added of record.addedNodes) scanForHeavyElements(added);
       }
-      scheduleWarmScan();
+      if (!blockObserver || !editorObserver) scheduleWarmScan();
     });
     mutationObserver.observe(root, { childList: true, subtree: true });
-    scheduleWarmScan();
+    if (!blockObserver || !editorObserver) scheduleWarmScan();
   }
 }
 
@@ -5313,6 +5381,32 @@ function install(pageWindow: Window & typeof globalThis): void {
   // initial response for this page session so those fetches are local reads.
   // Active responses must pass through until the server reports completion.
   const initialSnapshots = new Map<string, InitialConversationSnapshot>();
+  const responseBudget = new CacheBudget(RESPONSE_CACHE_BUDGET_BYTES);
+  const responseBytes = (response: MaterializedResponse): number =>
+    2 * (response.body.length + response.url.length + response.statusText.length +
+      response.headers.reduce((sum, [name, value]) => sum + name.length + value.length, 0)) +
+    (response.localPages ?? []).reduce((sum, page) => sum + 2 * page.cursor.length + responseBytes(page.response), 0);
+  let cacheCleanupTimer: number | undefined;
+  let cacheCleanupAt = Infinity;
+  const scheduleCacheCleanup = () => {
+    if (cache.size === 0) return;
+    let next = Infinity;
+    for (const value of cache.values()) next = Math.min(next, value.expiresAt);
+    if (cacheCleanupTimer != null && cacheCleanupAt <= next) return;
+    if (cacheCleanupTimer != null) pageWindow.clearTimeout(cacheCleanupTimer);
+    cacheCleanupAt = next;
+    cacheCleanupTimer = pageWindow.setTimeout(() => {
+      cacheCleanupTimer = undefined;
+      cacheCleanupAt = Infinity;
+      const now = Date.now();
+      for (const [key, value] of cache) {
+        if (value.expiresAt > now) continue;
+        cache.delete(key);
+        responseBudget.delete(`history:${key}`);
+      }
+      scheduleCacheCleanup();
+    }, Math.max(0, next - Date.now()));
+  };
   const initialSnapshotEpochs = new Map<string, number>();
   const asyncStatusActivity = new Map<string, boolean>();
   let globalInitialSnapshotEpoch = 0;
@@ -5348,6 +5442,7 @@ function install(pageWindow: Window & typeof globalThis): void {
       if (snapshot.rateLimited) continue;
       if (!conversationId || key.includes(`:${conversationId}:`)) {
         initialSnapshots.delete(key);
+        responseBudget.delete(`snapshot:${key}`);
       }
     }
     const root = pageWindow.document.documentElement;
@@ -5364,12 +5459,14 @@ function install(pageWindow: Window & typeof globalThis): void {
     if (!snapshot) return null;
     if (snapshot.expiresAt <= Date.now()) {
       initialSnapshots.delete(key);
+      responseBudget.delete(`snapshot:${key}`);
       return null;
     }
 
     // Refresh insertion order so the bounded map behaves as a small LRU.
     initialSnapshots.delete(key);
     initialSnapshots.set(key, snapshot);
+    responseBudget.touch(`snapshot:${key}`);
     const root = pageWindow.document.documentElement;
     root.dataset.chatgptInitialSnapshotHits = String(
       Number(root.dataset.chatgptInitialSnapshotHits ?? "0") + 1,
@@ -5421,7 +5518,10 @@ function install(pageWindow: Window & typeof globalThis): void {
       // snapshot. Active/unknown responses still share their in-flight Promise,
       // but the next sequential GET must be allowed to observe new progress.
       const existing = initialSnapshots.get(key);
-      if (existing && !existing.rateLimited) initialSnapshots.delete(key);
+      if (existing && !existing.rateLimited) {
+        initialSnapshots.delete(key);
+        responseBudget.delete(`snapshot:${key}`);
+      }
       const root = pageWindow.document.documentElement;
       const reason = response.activeConversation === true ? "Active" : "StaleOrUnknown";
       const datasetKey = `chatgptInitialSnapshotSkipped${reason}`;
@@ -5438,11 +5538,16 @@ function install(pageWindow: Window & typeof globalThis): void {
         )
       : Number.POSITIVE_INFINITY;
     initialSnapshots.delete(key);
+    responseBudget.delete(`snapshot:${key}`);
     initialSnapshots.set(key, { response, expiresAt, rateLimited });
+    if (!rateLimited) {
+      responseBudget.set(`snapshot:${key}`, responseBytes(response), () => initialSnapshots.delete(key));
+    }
     while (initialSnapshots.size > MAX_INITIAL_CONVERSATION_SNAPSHOTS) {
       const oldest = initialSnapshots.keys().next().value;
       if (typeof oldest !== "string") break;
       initialSnapshots.delete(oldest);
+      responseBudget.delete(`snapshot:${oldest}`);
     }
 
     const root = pageWindow.document.documentElement;
@@ -5459,7 +5564,11 @@ function install(pageWindow: Window & typeof globalThis): void {
     // Retry-After snapshots remain intact so a mutation cannot restart a 429
     // request loop while the server is explicitly asking the client to wait.
     invalidateInitialSnapshots(conversationId);
+    for (const key of cache.keys()) responseBudget.delete(`history:${key}`);
     cache.clear();
+    if (cacheCleanupTimer != null) pageWindow.clearTimeout(cacheCleanupTimer);
+    cacheCleanupTimer = undefined;
+    cacheCleanupAt = Infinity;
     inFlight.clear();
     responseFallback.clear();
   };
@@ -5682,6 +5791,7 @@ function install(pageWindow: Window & typeof globalThis): void {
         key = `paginated:${rewrittenUrl}`;
         const cached = cache.get(key);
         if (cached && cached.expiresAt > Date.now()) {
+          responseBudget.touch(`history:${key}`);
           const root = pageWindow.document.documentElement;
           const hits = Number(root.dataset.chatgptHistoryCacheHits ?? "0");
           root.dataset.chatgptHistoryCacheHits = String(hits + 1);
@@ -5702,7 +5812,10 @@ function install(pageWindow: Window & typeof globalThis): void {
           dispatchHistorySettledAfterCommit(pageWindow);
           return cloned;
         }
-        if (cached) cache.delete(key);
+        if (cached) {
+          cache.delete(key);
+          responseBudget.delete(`history:${key}`);
+        }
       }
       task = inFlight.get(key);
       if (!task) {
@@ -5776,6 +5889,8 @@ function install(pageWindow: Window & typeof globalThis): void {
           expiresAt: Date.now() + HISTORY_CACHE_TTL_MS,
           response: materialized,
         });
+        responseBudget.set(`history:${key}`, responseBytes(materialized), () => cache.delete(key));
+        scheduleCacheCleanup();
       }
 
       if (
@@ -5787,6 +5902,8 @@ function install(pageWindow: Window & typeof globalThis): void {
           expiresAt: Date.now() + CACHE_TTL_MS,
           response: materialized,
         });
+        responseBudget.set(`history:${key}`, responseBytes(materialized), () => cache.delete(key));
+        scheduleCacheCleanup();
       }
 
       if (materialized.optimized) {
