@@ -1,6 +1,6 @@
 import { mkdirSync, rmSync } from "node:fs";
 
-const VERSION = "0.1.4";
+const VERSION = "0.1.5";
 
 const header = `// ==UserScript==
 // @name         ChatGPT Performance Fix (B416-JAFLY fork)

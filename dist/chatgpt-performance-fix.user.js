@@ -2,7 +2,7 @@
 // @name         ChatGPT Performance Fix (B416-JAFLY fork)
 // @name:zh-CN   ChatGPT 性能优化（B416-JAFLY fork）
 // @namespace    https://github.com/B416-JAFLY
-// @version      0.1.4
+// @version      0.1.5
 // @description  Improve ChatGPT performance on long conversations.
 // @description:zh-CN 改善 ChatGPT 长会话性能。
 // @author       canxin
@@ -619,6 +619,45 @@
         entry.evict();
       }
     }
+  }
+
+  // src/modern-history.ts
+  function waitForHistoryConsent(page, signal) {
+    return new Promise((resolve, reject) => {
+      const path = page.location.pathname;
+      const button = page.document.createElement("button");
+      button.type = "button";
+      button.dataset.chatgptModernHistoryLoad = "true";
+      button.textContent = "加载较早消息";
+      button.style.cssText = "position:fixed;right:24px;bottom:100px;z-index:1000;padding:10px 16px;border:1px solid #888;border-radius:12px;background:var(--main-surface-primary,#fff);color:var(--text-primary,#222);cursor:pointer";
+      let timer;
+      const cleanup = () => {
+        button.remove();
+        if (timer != null)
+          page.clearInterval(timer);
+        signal?.removeEventListener("abort", abort);
+        page.removeEventListener("pagehide", abort);
+      };
+      const abort = () => {
+        cleanup();
+        reject(new page.DOMException("History request cancelled", "AbortError"));
+      };
+      button.onclick = () => {
+        cleanup();
+        resolve();
+      };
+      if (signal?.aborted) {
+        abort();
+        return;
+      }
+      signal?.addEventListener("abort", abort, { once: true });
+      page.addEventListener("pagehide", abort, { once: true });
+      timer = page.setInterval(() => {
+        if (page.location.pathname !== path)
+          abort();
+      }, 250);
+      (page.document.body ?? page.document.documentElement).append(button);
+    });
   }
 
   // src/chatgpt-performance-fix.user.ts
@@ -3734,8 +3773,18 @@ html [data-chatgpt-static-code-state="loading"] pre {
       return task;
     };
     const patchedJson = function() {
-      if (!shouldHandle(this))
+      if (!shouldHandle(this)) {
+        const match = matchConversationApiUrl(this.url, pageWindow.location.href);
+        if (!INTERNAL_RESPONSE_READS.has(this) && this.ok && match && match.kind !== "legacy-full" && observePayload) {
+          return nativeJson.call(this).then((payload) => {
+            try {
+              observePayload(payload);
+            } catch {}
+            return payload;
+          });
+        }
         return nativeJson.call(this);
+      }
       return process(this).then((value) => cloneJsonPayload(pageWindow, value.payload, value.body));
     };
     const patchedText = function() {
@@ -4420,6 +4469,12 @@ html [data-chatgpt-static-code-state="loading"] pre {
         }
       }
       if (apiMatch.kind !== "legacy-full" && requestUrlObject.searchParams.has("include_message_id")) {
+        return originalFetch(input, init);
+      }
+      if (apiMatch.kind === "paginated-messages" && currentConversationId(pageWindow) === apiMatch.conversationId && pageWindow.document.querySelector(".thread-scroll-container [data-turn-key]") && !pageWindow.document.querySelector('[data-testid*="conversation-pagination-sentinel"]')) {
+        const signal = init?.signal ?? input?.signal;
+        await waitForHistoryConsent(pageWindow, signal);
+        pageWindow.document.documentElement.dataset.chatgptModernHistoryMode = "manual";
         return originalFetch(input, init);
       }
       let key;

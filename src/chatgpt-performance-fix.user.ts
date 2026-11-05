@@ -13,6 +13,7 @@ import {
   type PaginatedOptimizationStats,
 } from "./optimizer";
 import { CacheBudget } from "./cache-budget";
+import { waitForHistoryConsent } from "./modern-history";
 
 declare const unsafeWindow: (Window & typeof globalThis) | undefined;
 declare const GM_registerMenuCommand:
@@ -4019,7 +4020,16 @@ function installLegacyResponseFallback(
   };
 
   const patchedJson = function (this: Response): Promise<unknown> {
-    if (!shouldHandle(this)) return nativeJson.call(this);
+    if (!shouldHandle(this)) {
+      const match = matchConversationApiUrl(this.url, pageWindow.location.href);
+      if (!INTERNAL_RESPONSE_READS.has(this) && this.ok && match && match.kind !== "legacy-full" && observePayload) {
+        return nativeJson.call(this).then((payload) => {
+          try { observePayload(payload); } catch { /* Observation must not affect ChatGPT. */ }
+          return payload;
+        });
+      }
+      return nativeJson.call(this);
+    }
     return process(this).then((value) =>
       cloneJsonPayload(pageWindow, value.payload, value.body)
     );
@@ -5160,6 +5170,17 @@ function install(pageWindow: Window & typeof globalThis): void {
       apiMatch.kind !== "legacy-full" &&
       requestUrlObject.searchParams.has("include_message_id")
     ) {
+      return originalFetch(input, init);
+    }
+
+    if (apiMatch.kind === "paginated-messages" &&
+      currentConversationId(pageWindow) === apiMatch.conversationId &&
+      pageWindow.document.querySelector(".thread-scroll-container [data-turn-key]") &&
+      !pageWindow.document.querySelector('[data-testid*="conversation-pagination-sentinel"]')) {
+      const signal = init?.signal ?? (input as Request)?.signal;
+      await waitForHistoryConsent(pageWindow, signal);
+      pageWindow.document.documentElement.dataset.chatgptModernHistoryMode = "manual";
+      // Preserve the native cursor, batch size and response on the new renderer.
       return originalFetch(input, init);
     }
 
