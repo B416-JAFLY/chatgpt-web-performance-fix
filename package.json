@@ -18,20 +18,20 @@
     "analyze:validation": "python3 analysis/build-fix-validation.py",
     "test:rich-browser": "bun run build && bun run tests/rich-text-browser.ts"
   },
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Tampermonkey userscript for improving ChatGPT long-conversation performance.",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/canxin121/chatgpt-web-performance-fix.git"
+    "url": "https://github.com/B416-JAFLY/chatgpt-web-performance-fix.git"
   },
   "author": {
     "name": "canxin",
     "url": "https://github.com/canxin121"
   },
-  "homepage": "https://github.com/canxin121/chatgpt-web-performance-fix#readme",
+  "homepage": "https://github.com/B416-JAFLY/chatgpt-web-performance-fix#readme",
   "bugs": {
-    "url": "https://github.com/canxin121/chatgpt-web-performance-fix/issues"
+    "url": "https://github.com/B416-JAFLY/chatgpt-web-performance-fix/issues"
   },
   "keywords": [
     "chatgpt",

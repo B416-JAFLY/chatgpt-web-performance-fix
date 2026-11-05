@@ -2,14 +2,14 @@
 // @name         ChatGPT Performance Fix (B416-JAFLY fork)
 // @name:zh-CN   ChatGPT 性能优化（B416-JAFLY fork）
 // @namespace    https://github.com/B416-JAFLY
-// @version      0.1.1
+// @version      0.1.2
 // @description  Improve ChatGPT performance on long conversations.
 // @description:zh-CN 改善 ChatGPT 长会话性能。
 // @author       canxin
 // @homepageURL  https://github.com/B416-JAFLY/chatgpt-web-performance-fix
 // @supportURL   https://github.com/B416-JAFLY/chatgpt-web-performance-fix/issues
-// @updateURL    https://raw.githubusercontent.com/B416-JAFLY/chatgpt-web-performance-fix/improve/observer-overhead/dist/chatgpt-performance-fix.user.js
-// @downloadURL  https://raw.githubusercontent.com/B416-JAFLY/chatgpt-web-performance-fix/improve/observer-overhead/dist/chatgpt-performance-fix.user.js
+// @updateURL    https://raw.githubusercontent.com/B416-JAFLY/chatgpt-web-performance-fix/main/dist/chatgpt-performance-fix.user.js
+// @downloadURL  https://raw.githubusercontent.com/B416-JAFLY/chatgpt-web-performance-fix/main/dist/chatgpt-performance-fix.user.js
 // @match        https://chatgpt.com/*
 // @run-at       document-start
 // @sandbox      raw

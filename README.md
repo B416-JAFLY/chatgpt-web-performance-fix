@@ -1,6 +1,6 @@
 # ChatGPT Performance Fix
 
-> 此分支是 B416-JAFLY 的实验性 fork，减少流式回复期间无关页面变动造成的侧栏扫描。[安装此分支的脚本](https://raw.githubusercontent.com/B416-JAFLY/chatgpt-web-performance-fix/improve/observer-overhead/dist/chatgpt-performance-fix.user.js)。安装前请在 Tampermonkey 中停用原版，避免两个脚本同时运行；此 fork 使用独立名称和命名空间，设置需要重新选择。
+> 这是 B416-JAFLY 的实验性 fork，基于 [canxin121 的原项目](https://github.com/canxin121/chatgpt-web-performance-fix)。安装前请在 Tampermonkey 中停用原版，避免两个脚本同时运行；此 fork 使用独立名称和命名空间，设置需要重新选择。
 
 此分支使用 IntersectionObserver 预热富文本，移除冷元素时停止观察；支持保留的成功会话快照与可重建的历史响应共享约 16 MiB 的字符串预算，并按最近使用情况淘汰。估算值不是 JavaScript 堆的实际占用；仍供合成游标使用的本地分页和静态代码数据不包含在预算内。原有 429 退避记录单独保留。浏览器回归测试可运行 `bun run test:rich-browser`，不需要私有会话采样数据。
 
@@ -24,7 +24,7 @@
 
 先安装 [Tampermonkey](https://www.tampermonkey.net/)，然后点击：
 
-### [一键安装 ChatGPT Performance Fix](https://raw.githubusercontent.com/canxin121/chatgpt-web-performance-fix/main/dist/chatgpt-performance-fix.user.js)
+### [一键安装 ChatGPT Performance Fix](https://raw.githubusercontent.com/B416-JAFLY/chatgpt-web-performance-fix/main/dist/chatgpt-performance-fix.user.js)
 
 Tampermonkey 会自动打开脚本安装页面。安装完成后刷新 `https://chatgpt.com/` 即可。
 
