@@ -20,13 +20,7 @@ window.IntersectionObserver=class {
  const payload=await response.json();
  if(payload.messages?.[0]?.id!=='fixture-user-message')throw Error('response was changed');
  await wait(300);
- const userBadge=document.querySelector('[data-chatgpt-search-message-ids="fixture-user-message"] [data-chatgpt-message-metadata="true"]');
- if(!userBadge)throw Error('modern user message metadata not rendered');
- if(userBadge.getAttribute('data-chatgpt-message-metadata-role')!=='user')throw Error('user badge role mismatch: '+userBadge.getAttribute('data-chatgpt-message-metadata-role'));
- if(!userBadge.querySelector('[data-chatgpt-message-model]'))throw Error('user badge inferred model missing');
- const aiBadge=document.querySelector('[data-chatgpt-selection-message-id="fixture-message"] [data-chatgpt-message-metadata="true"]');
- if(!aiBadge)throw Error('modern assistant message metadata not rendered');
- if(aiBadge.getAttribute('data-chatgpt-message-metadata-role')!=='assistant')throw Error('ai badge role mismatch: '+aiBadge.getAttribute('data-chatgpt-message-metadata-role'));
+ if(document.querySelector('[data-chatgpt-message-metadata]'))throw Error('unexpected message metadata rendered');
  const blocks=document.querySelector('#blocks');
  for(let i=0;i<80;i++){const x=document.createElement('div');x.className='katex-display';x.style.height='120px';x.textContent='formula';blocks.append(x)}
  await wait(300);

@@ -31,8 +31,6 @@ interface StoredSettings {
   initialTurns: TurnLoadSetting;
   /** Visible user turns loaded by one manual history action. */
   historyBatchTurns: TurnLoadSetting;
-  /** Render the server timestamp and effective model below visible messages. */
-  showMessageMetadata: boolean;
 }
 
 interface StaticCodeBlock {
@@ -102,7 +100,6 @@ const DEFAULT_SETTINGS: Readonly<StoredSettings> = {
   mode: "balanced",
   initialTurns: 2,
   historyBatchTurns: 2,
-  showMessageMetadata: true,
 };
 
 const MODE_OPTIONS: Record<
@@ -167,7 +164,6 @@ function readSettings(storage: Storage): StoredSettings {
         value?.historyBatchTurns,
         DEFAULT_SETTINGS.historyBatchTurns,
       ),
-      showMessageMetadata: value?.showMessageMetadata !== false,
     };
   } catch {
     return { ...DEFAULT_SETTINGS };
@@ -2076,684 +2072,6 @@ function inspectOutgoingBody(body: BodyInit | null | undefined): OutgoingMessage
   }
 }
 
-type MessageModelSource = "resolved" | "message" | "inferred" | "requested";
-type MessageTimeSource = "server" | "client";
-
-interface MessageDisplayMetadata {
-  id: string;
-  role?: "user" | "assistant";
-  createdAtMs?: number;
-  timeSource?: MessageTimeSource;
-  timeRank: number;
-  modelSlug?: string;
-  modelSource?: MessageModelSource;
-  modelRank: number;
-}
-
-interface MessageMetadataDisplayController {
-  ingestPayload: (payload: unknown) => void;
-  noteOutgoing: (probe: OutgoingMessageProbe) => void;
-  observeResponse: (response: Response) => void;
-}
-
-type ConversationPayloadObserver = (payload: unknown) => void;
-
-function effectiveMessageModel(
-  message: ConversationMessage,
-): { slug: string; source: "resolved" | "message" | "requested" } | null {
-  const metadata = message.metadata;
-  const resolved = firstNonEmptyString(
-    metadata?.resolved_model_slug,
-    message.resolved_model_slug,
-  );
-  if (resolved) return { slug: resolved, source: "resolved" };
-  const recorded = firstNonEmptyString(
-    metadata?.model_slug,
-    metadata?.default_model_slug,
-    message.model_slug,
-    message.default_model_slug,
-    message.model,
-  );
-  if (recorded) return { slug: recorded, source: "message" };
-  const requested = firstNonEmptyString(
-    metadata?.requested_model_slug,
-    message.requested_model_slug,
-    message.requested_default_model,
-  );
-  return requested ? { slug: requested, source: "requested" } : null;
-}
-
-function isVisibleAssistantForMetadata(message: ConversationMessage): boolean {
-  if (message.author?.role !== "assistant") return false;
-  if (message.metadata?.is_visually_hidden_from_conversation === true) return false;
-  if (message.recipient != null && message.recipient !== "all") return false;
-  return !["code", "execution_output", "thoughts", "reasoning_recap"].includes(
-    String(message.content?.content_type ?? ""),
-  );
-}
-
-function friendlyModelLabel(slug: string): string {
-  const normalized = slug.trim().replace(/\s+/g, " ");
-  const titleCaseWords = (value: string): string =>
-    value
-      .split(/[-_\s]+/)
-      .filter(Boolean)
-      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-      .join(" ");
-  const gpt = normalized.match(/^gpt-(\d+)(?:[-.](\d+))?(.*)$/i);
-  if (gpt) {
-    const version = gpt[2] ? `${gpt[1]}.${gpt[2]}` : gpt[1];
-    const suffixText = gpt[3].replace(/^[-_.]+/, "");
-    const compactSuffix = suffixText.match(/^([a-z])(?:[-_](.*))?$/i);
-    const suffix = compactSuffix
-      ? `${compactSuffix[1].toLowerCase()}${compactSuffix[2]
-          ? ` ${titleCaseWords(compactSuffix[2])}`
-          : ""}`
-      : titleCaseWords(suffixText);
-    return `GPT-${version}${suffix ? ` ${suffix}` : ""}`;
-  }
-  if (/^chatgpt-/i.test(normalized)) {
-    return `ChatGPT ${titleCaseWords(normalized.replace(/^chatgpt-/i, ""))}`;
-  }
-  return titleCaseWords(normalized);
-}
-
-function installMessageMetadataDisplay(
-  pageWindow: Window & typeof globalThis,
-): MessageMetadataDisplayController {
-  const records = new Map<string, MessageDisplayMetadata>();
-  const elementsById = new Map<string, Set<HTMLElement>>();
-  const pendingScanRoots = new Set<Element>();
-  let scanFrame: number | undefined;
-
-  const ensureStyles = () => {
-    const id = "chatgpt-message-metadata-style";
-    if (pageWindow.document.getElementById(id)) return;
-    const style = pageWindow.document.createElement("style");
-    style.id = id;
-    style.textContent = `
-[data-chatgpt-message-metadata="true"] {
-  box-sizing: border-box;
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  align-self: flex-start;
-  width: fit-content;
-  max-width: 100%;
-  margin-block: 7px 1px;
-  padding: 2px 7px;
-  border: 1px solid rgba(127,127,127,.15);
-  border-radius: 999px;
-  background: rgba(127,127,127,.06);
-  color: var(--token-text-secondary, var(--text-secondary, currentColor));
-  font: 500 10.5px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-  letter-spacing: .005em;
-  opacity: .66;
-  white-space: nowrap;
-  transition: opacity .15s ease, background-color .15s ease;
-}
-[data-chatgpt-message-metadata="true"]:hover {
-  opacity: .92;
-  border-color: rgba(127,127,127,.24);
-  background: rgba(127,127,127,.1);
-}
-@supports (color: color-mix(in srgb, currentColor 5%, transparent)) {
-  [data-chatgpt-message-metadata="true"] {
-    border-color: color-mix(in srgb, currentColor 13%, transparent);
-    background: color-mix(in srgb, currentColor 5%, transparent);
-  }
-  [data-chatgpt-message-metadata="true"]:hover {
-    border-color: color-mix(in srgb, currentColor 22%, transparent);
-    background: color-mix(in srgb, currentColor 9%, transparent);
-  }
-}
-[data-chatgpt-message-metadata="true"] time,
-[data-chatgpt-message-metadata="true"] [data-chatgpt-message-model] {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-[data-chatgpt-message-metadata="true"] time {
-  flex: 0 1 auto;
-}
-[data-chatgpt-message-metadata="true"] [data-chatgpt-message-model] {
-  flex: 0 1 auto;
-  font-weight: 600;
-}
-[data-chatgpt-message-metadata="true"] [data-chatgpt-message-time]::before {
-  content: "◷";
-  margin-inline-end: 3px;
-  font-size: 11px;
-  opacity: .72;
-}
-[data-chatgpt-message-metadata="true"] [data-chatgpt-message-model]::before {
-  content: "✦";
-  margin-inline-end: 3px;
-  font-size: 10px;
-  opacity: .68;
-}
-[data-chatgpt-message-metadata-role="user"] {
-  margin-inline-start: auto;
-  align-self: flex-end;
-}
-[data-chatgpt-message-metadata-role="assistant"] {
-  margin-inline-end: auto;
-}
-[data-chatgpt-message-metadata="true"] [aria-hidden="true"] {
-  opacity: .55;
-}
-@media print {
-  [data-chatgpt-message-metadata="true"] { display: none !important; }
-}`;
-    const styleTarget = pageWindow.document.head ?? pageWindow.document.documentElement;
-    styleTarget?.append(style);
-  };
-
-  const dateFormatter = new Intl.DateTimeFormat("zh-CN", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hourCycle: "h23",
-  });
-
-  const formatDate = (milliseconds: number): string => {
-    const parts = Object.fromEntries(
-      dateFormatter.formatToParts(new Date(milliseconds)).map((part) => [
-        part.type,
-        part.value,
-      ]),
-    );
-    return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
-  };
-
-  const roleForElement = (element: HTMLElement): "user" | "assistant" | null => {
-    const direct = element.getAttribute("data-message-author-role");
-    if (direct === "user" || direct === "assistant") return direct;
-    const roleHost = element.closest<HTMLElement>("[data-message-author-role]");
-    const nestedRole = roleHost?.getAttribute("data-message-author-role");
-    if (nestedRole === "user" || nestedRole === "assistant") return nestedRole;
-    const turn = element.closest<HTMLElement>('[data-turn="user"], [data-turn="assistant"]');
-    const turnRole = turn?.getAttribute("data-turn");
-    if (turnRole === "user" || turnRole === "assistant") return turnRole;
-
-    if (
-      element.matches('.group\\/user-message, [class*="group/user-message"]') ||
-      element.closest('.group\\/user-message, [class*="group/user-message"]') ||
-      element.matches('[data-chatgpt-search-unit-key*=":user"], [data-content-search-unit-key*=":user"]') ||
-      element.closest('[data-chatgpt-search-unit-key*=":user"], [data-content-search-unit-key*=":user"]')
-    ) {
-      return "user";
-    }
-
-    if (
-      element.matches('.agent-turn, [class*="agent-turn"]') ||
-      element.closest('.agent-turn, [class*="agent-turn"]') ||
-      element.matches('[data-chatgpt-search-unit-key*=":assistant"], [data-content-search-unit-key*=":assistant"]') ||
-      element.closest('[data-chatgpt-search-unit-key*=":assistant"], [data-content-search-unit-key*=":assistant"]') ||
-      element.matches('[data-chatgpt-selection-message-id]') ||
-      element.closest('[data-chatgpt-selection-message-id]')
-    ) {
-      return "assistant";
-    }
-
-    return null;
-  };
-
-  const renderRecord = (id: string): void => {
-    const record = records.get(id);
-    const elements = elementsById.get(id);
-    if (!record || !elements) return;
-    for (const element of [...elements]) {
-      if (!element.isConnected) {
-        elements.delete(element);
-        continue;
-      }
-      const role = roleForElement(element) ?? record.role;
-      if (role !== "user" && role !== "assistant") continue;
-      if (record.createdAtMs == null && !record.modelSlug) continue;
-      ensureStyles();
-      let host = [...element.children].find(
-        (child): child is HTMLElement =>
-          child instanceof pageWindow.HTMLElement &&
-          child.dataset.chatgptMessageMetadata === "true",
-      );
-      if (!host) {
-        host = pageWindow.document.createElement("div");
-        host.dataset.chatgptMessageMetadata = "true";
-        const delivery = [...element.children].find(
-          (child): child is HTMLElement =>
-            child instanceof pageWindow.HTMLElement &&
-            child.dataset.chatgptDeliveryStatus === "true",
-        );
-        element.insertBefore(host, delivery ?? null);
-      }
-      const fingerprint = [
-        role,
-        record.createdAtMs ?? "",
-        record.timeSource ?? "",
-        record.modelSlug ?? "",
-        record.modelSource ?? "",
-      ].join("|");
-      if (host.dataset.chatgptMessageMetadataFingerprint === fingerprint) continue;
-      host.dataset.chatgptMessageMetadataFingerprint = fingerprint;
-      host.dataset.chatgptMessageMetadataRole = role;
-      host.dataset.chatgptMessageMetadataTimeSource = record.timeSource ?? "";
-      host.dataset.chatgptMessageMetadataModelSource = record.modelSource ?? "";
-      host.replaceChildren();
-      const labels: string[] = [];
-
-      if (record.createdAtMs != null) {
-        const timeWrap = pageWindow.document.createElement("span");
-        timeWrap.dataset.chatgptMessageTime = "true";
-        const time = pageWindow.document.createElement("time");
-        const formatted = formatDate(record.createdAtMs);
-        time.dateTime = new Date(record.createdAtMs).toISOString();
-        time.textContent = formatted;
-        labels.push(`${record.timeSource === "server" ? "服务器创建时间" : "本地发送时间"} ${formatted}`);
-        timeWrap.append(time);
-        host.append(timeWrap);
-      }
-      if (record.createdAtMs != null && record.modelSlug) {
-        const separator = pageWindow.document.createElement("span");
-        separator.setAttribute("aria-hidden", "true");
-        separator.textContent = "·";
-        host.append(separator);
-      }
-      if (record.modelSlug) {
-        const model = pageWindow.document.createElement("span");
-        model.dataset.chatgptMessageModel = record.modelSlug;
-        model.textContent = friendlyModelLabel(record.modelSlug);
-        host.append(model);
-        const sourceLabel = record.modelSource === "resolved"
-          ? "解析后的有效模型"
-          : record.modelSource === "message"
-            ? "消息记录模型"
-            : record.modelSource === "inferred"
-              ? "由当前回复推断"
-              : "请求选择模型";
-        labels.push(`${sourceLabel} ${record.modelSlug}`);
-      }
-      host.setAttribute("aria-label", labels.join("，"));
-      host.title = labels.join("\n");
-    }
-    if (elements.size === 0) elementsById.delete(id);
-  };
-
-  const registerCandidate = (candidate: Element): void => {
-    if (candidate.hasAttribute("data-chatgpt-selection-message-id")) {
-      const id = candidate.getAttribute("data-chatgpt-selection-message-id");
-      if (!id) return;
-      const elements = elementsById.get(id) ?? new Set<HTMLElement>();
-      elements.add(candidate as HTMLElement);
-      elementsById.set(id, elements);
-      renderRecord(id);
-      return;
-    }
-    const searchIdsHost = candidate.hasAttribute("data-chatgpt-search-message-ids")
-      ? (candidate as HTMLElement)
-      : candidate.closest<HTMLElement>("[data-chatgpt-search-message-ids]") ??
-        candidate.querySelector<HTMLElement>("[data-chatgpt-search-message-ids]");
-    if (searchIdsHost) {
-      const rawIds = searchIdsHost.getAttribute("data-chatgpt-search-message-ids");
-      if (rawIds) {
-        const ids = rawIds.split(/[\s,]+/).filter(Boolean);
-        for (const id of ids) {
-          const elements = elementsById.get(id) ?? new Set<HTMLElement>();
-          elements.add(searchIdsHost);
-          elementsById.set(id, elements);
-          renderRecord(id);
-        }
-        if (ids.length > 0) return;
-      }
-    }
-    const roleElement = candidate.matches("[data-message-author-role]")
-      ? (candidate as HTMLElement)
-      : candidate.closest<HTMLElement>("[data-message-author-role]") ??
-        candidate.querySelector<HTMLElement>("[data-message-author-role]");
-    const idElement = roleElement?.hasAttribute("data-message-id")
-      ? roleElement
-      : candidate.hasAttribute("data-message-id")
-        ? (candidate as HTMLElement)
-        : roleElement?.querySelector<HTMLElement>("[data-message-id]") ??
-          candidate.closest<HTMLElement>("[data-message-id]") ??
-          candidate.querySelector<HTMLElement>("[data-message-id]");
-    const host = roleElement ?? idElement;
-    const id = idElement?.getAttribute("data-message-id");
-    if (!host || !id) return;
-    const role = roleForElement(host) ?? records.get(id)?.role;
-    if (!role) return;
-    const elements = elementsById.get(id) ?? new Set<HTMLElement>();
-    elements.add(host);
-    elementsById.set(id, elements);
-    renderRecord(id);
-  };
-
-  const scanRoot = (root: Element): void => {
-    const candidates = new Set<Element>([root]);
-    const selector =
-      "[data-message-author-role], [data-message-id], [data-chatgpt-selection-message-id], [data-chatgpt-search-message-ids], [data-chatgpt-search-unit-key], .group\\/user-message";
-    const closest = root.closest(selector);
-    if (closest) candidates.add(closest);
-    for (const element of root.querySelectorAll(selector)) {
-      candidates.add(element);
-    }
-    for (const candidate of candidates) registerCandidate(candidate);
-  };
-
-  const scheduleScan = (root: Element = pageWindow.document.documentElement) => {
-    pendingScanRoots.add(root);
-    if (scanFrame != null) return;
-    const run = () => {
-      scanFrame = undefined;
-      const roots = [...pendingScanRoots];
-      pendingScanRoots.clear();
-      for (const pendingRoot of roots) {
-        if (pendingRoot.isConnected) scanRoot(pendingRoot);
-      }
-    };
-    scanFrame = typeof pageWindow.requestAnimationFrame === "function"
-      ? pageWindow.requestAnimationFrame(run)
-      : pageWindow.setTimeout(run, 0);
-  };
-
-  const mergeRecord = (
-    id: string,
-    next: Partial<Omit<MessageDisplayMetadata, "id">>,
-  ): boolean => {
-    if (!id) return false;
-    const record = records.get(id) ?? { id, timeRank: 0, modelRank: 0 };
-    let changed = false;
-    if (
-      (next.role === "user" || next.role === "assistant") &&
-      record.role !== next.role
-    ) {
-      record.role = next.role;
-      changed = true;
-    }
-    if (
-      next.createdAtMs != null &&
-      Number.isFinite(next.createdAtMs) &&
-      (next.timeRank ?? 0) >= record.timeRank &&
-      (record.createdAtMs !== next.createdAtMs || record.timeSource !== next.timeSource)
-    ) {
-      record.createdAtMs = next.createdAtMs;
-      record.timeSource = next.timeSource;
-      record.timeRank = next.timeRank ?? 0;
-      changed = true;
-    }
-    if (
-      next.modelSlug &&
-      (next.modelRank ?? 0) >= record.modelRank &&
-      (record.modelSlug !== next.modelSlug || record.modelSource !== next.modelSource)
-    ) {
-      record.modelSlug = next.modelSlug;
-      record.modelSource = next.modelSource;
-      record.modelRank = next.modelRank ?? 0;
-      changed = true;
-    }
-    if (!changed) return false;
-    records.delete(id);
-    records.set(id, record);
-    while (records.size > 20_000) {
-      const oldest = records.keys().next().value;
-      if (typeof oldest !== "string") break;
-      records.delete(oldest);
-      elementsById.delete(oldest);
-    }
-    renderRecord(id);
-    return true;
-  };
-
-  const ingestMessage = (message: ConversationMessage): void => {
-    const id = nonEmptyString(message.id);
-    const role = message.author?.role;
-    if (!id || (role !== "user" && role !== "assistant")) return;
-    const model = effectiveMessageModel(message);
-    mergeRecord(id, {
-      role,
-      createdAtMs: chatgptTimestampMs(message.create_time),
-      timeSource: "server",
-      timeRank: chatgptTimestampMs(message.create_time) == null ? 0 : 2,
-      modelSlug: model?.slug,
-      modelSource: model?.source,
-      modelRank:
-        model?.source === "resolved" ? 4 : model?.source === "message" ? 3 : 1,
-    });
-  };
-
-  const ingestMessages = (messages: ConversationMessage[]): void => {
-    for (const message of messages) ingestMessage(message);
-    let userId: string | null = null;
-    for (const message of messages) {
-      if (message.author?.role === "user") {
-        userId = nonEmptyString(message.id);
-        continue;
-      }
-      if (!userId || !isVisibleAssistantForMetadata(message)) continue;
-      const model = effectiveMessageModel(message);
-      if (!model) continue;
-      mergeRecord(userId, {
-        modelSlug: model.slug,
-        modelSource: "inferred",
-        modelRank: 2,
-      });
-    }
-  };
-
-  const ingestPayload = (payload: unknown): void => {
-    const value = recordFromUnknown(payload);
-    if (!value) return;
-    let ingested = false;
-    const directMessage = recordFromUnknown(value.message);
-    if (directMessage) {
-      ingestMessages([directMessage as ConversationMessage]);
-      ingested = true;
-    }
-    if (Array.isArray(value.messages)) {
-      const messages = value.messages
-        .map(recordFromUnknown)
-        .filter((message): message is Record<string, unknown> => message != null) as
-        ConversationMessage[];
-      ingestMessages(messages);
-      ingested = ingested || messages.length > 0;
-    }
-    const mapping = recordFromUnknown(value.mapping);
-    if (mapping) {
-      const allMessages = Object.values(mapping)
-        .map(recordFromUnknown)
-        .map((node) => recordFromUnknown(node?.message))
-        .filter((message): message is Record<string, unknown> => message != null) as
-        ConversationMessage[];
-      for (const message of allMessages) ingestMessage(message);
-
-      const path: ConversationMessage[] = [];
-      const seen = new Set<string>();
-      let nodeId = nonEmptyString(value.current_node);
-      while (nodeId && !seen.has(nodeId)) {
-        seen.add(nodeId);
-        const node = recordFromUnknown(mapping[nodeId]);
-        const message = recordFromUnknown(node?.message);
-        if (message) path.push(message as ConversationMessage);
-        nodeId = nonEmptyString(node?.parent);
-      }
-      ingestMessages(path.reverse());
-      ingested = ingested || allMessages.length > 0;
-    }
-    const nestedConversation = recordFromUnknown(value.conversation);
-    if (nestedConversation && nestedConversation !== value) {
-      ingestPayload(nestedConversation);
-    }
-    if (ingested) {
-      const root = pageWindow.document.documentElement;
-      root.dataset.chatgptMessageMetadataRecords = String(records.size);
-      scheduleScan();
-    }
-  };
-
-  const noteOutgoing = (probe: OutgoingMessageProbe): void => {
-    if (!probe.hasUserMessage || !probe.messageId) return;
-    mergeRecord(probe.messageId, {
-      role: "user",
-      createdAtMs: probe.createdAtMs ?? Date.now(),
-      timeSource: "client",
-      timeRank: 1,
-      modelSlug: probe.requestedModelSlug ?? undefined,
-      modelSource: probe.requestedModelSlug ? "requested" : undefined,
-      modelRank: probe.requestedModelSlug ? 1 : 0,
-    });
-    pageWindow.document.documentElement.dataset.chatgptOutgoingMessageMetadata =
-      "captured";
-    scheduleScan();
-  };
-
-  const observeResponse = (response: Response): void => {
-    if (!response.ok) return;
-    let clone: Response;
-    try {
-      clone = response.clone();
-    } catch {
-      return;
-    }
-    const contentType = clone.headers.get("content-type")?.toLowerCase() ?? "";
-    if (contentType.includes("text/event-stream")) {
-      const root = pageWindow.document.documentElement;
-      root.dataset.chatgptMessageMetadataStreams = String(
-        Number(root.dataset.chatgptMessageMetadataStreams ?? "0") + 1,
-      );
-      void (async () => {
-        const reader = clone.body?.getReader();
-        if (!reader) return;
-        const decoder = new pageWindow.TextDecoder();
-        const completeIds = new Set<string>();
-        const parseAttempts = new Map<string, number>();
-        let buffer = "";
-        const processBlock = (block: string): boolean => {
-          const data = block
-            .split(/\r?\n/)
-            .filter((line) => line.startsWith("data:"))
-            .map((line) => line.slice(5).trimStart())
-            .join("\n")
-            .trim();
-          if (!data) return false;
-          if (data === "[DONE]") return true;
-          if (
-            !data.includes('"message"') &&
-            !data.includes('"messages"') &&
-            !data.includes('"author"')
-          ) {
-            return false;
-          }
-          const messageOffset = data.indexOf('"message"');
-          const idProbe = (messageOffset >= 0 ? data.slice(messageOffset) : data)
-            .slice(0, 4_096)
-            .match(/"id"\s*:\s*"([^"\\]+)"/);
-          const candidateId = idProbe?.[1] ?? "unknown";
-          if (completeIds.has(candidateId)) return false;
-          const attempts = parseAttempts.get(candidateId) ?? 0;
-          if (attempts >= 4) return false;
-          parseAttempts.set(candidateId, attempts + 1);
-          try {
-            ingestPayload(JSON.parse(data));
-            if (candidateId !== "unknown") {
-              const record = records.get(candidateId);
-              if (record?.createdAtMs != null && record.modelSlug) {
-                completeIds.add(candidateId);
-              }
-            }
-          } catch {
-            // A partial/non-JSON SSE payload is not message metadata.
-          }
-          return false;
-        };
-
-        try {
-          for (;;) {
-            const chunk = await reader.read();
-            if (chunk.done) break;
-            buffer += decoder.decode(chunk.value, { stream: true });
-            for (;;) {
-              const boundary = /\r?\n\r?\n/.exec(buffer);
-              if (!boundary) break;
-              const block = buffer.slice(0, boundary.index);
-              buffer = buffer.slice(boundary.index + boundary[0].length);
-              if (processBlock(block)) {
-                await reader.cancel();
-                return;
-              }
-            }
-          }
-          buffer += decoder.decode();
-          if (buffer) processBlock(buffer);
-        } catch {
-          // The application owns the original stream. Metadata observation must
-          // never alter or surface errors from the cloned branch.
-        }
-      })();
-      return;
-    }
-    if (contentType.includes("json")) {
-      void clone.json().then(ingestPayload).catch(() => undefined);
-    }
-  };
-
-  const observer = new pageWindow.MutationObserver((records) => {
-    for (const mutation of records) {
-      if (mutation.type === "attributes") {
-        if (mutation.target instanceof pageWindow.Element) {
-          scheduleScan(mutation.target);
-        }
-        continue;
-      }
-      for (const node of mutation.removedNodes) {
-        if (!(node instanceof pageWindow.Element) || node.isConnected) continue;
-        const candidates = [
-          node,
-          ...node.querySelectorAll(
-            "[data-message-id], [data-chatgpt-selection-message-id], [data-chatgpt-search-message-ids]",
-          ),
-        ];
-        for (const candidate of candidates) {
-          const rawId =
-            candidate.getAttribute("data-message-id") ??
-            candidate.getAttribute("data-chatgpt-selection-message-id") ??
-            candidate.getAttribute("data-chatgpt-search-message-ids");
-          if (!rawId) continue;
-          for (const id of rawId.split(/[\s,]+/).filter(Boolean)) {
-            const elements = elementsById.get(id);
-            if (!elements) continue;
-            for (const element of elements) if (!element.isConnected) elements.delete(element);
-            if (elements.size === 0) elementsById.delete(id);
-          }
-        }
-      }
-      for (const node of mutation.addedNodes) {
-        if (node instanceof pageWindow.Element) scheduleScan(node);
-      }
-    }
-  });
-  observer.observe(pageWindow.document.documentElement, {
-    attributes: true,
-    attributeFilter: [
-      "data-message-id",
-      "data-message-author-role",
-      "data-turn",
-      "data-chatgpt-selection-message-id",
-      "data-chatgpt-search-message-ids",
-      "data-chatgpt-search-unit-key",
-    ],
-    childList: true,
-    subtree: true,
-  });
-  ensureStyles();
-  scheduleScan();
-  pageWindow.document.documentElement.dataset.chatgptMessageMetadataDisplay = "enabled";
-
-  return { ingestPayload, noteOutgoing, observeResponse };
-}
-
 function installDeliveryVerifier(
   pageWindow: Window & typeof globalThis,
 ): {
@@ -4021,7 +3339,6 @@ function cloneJsonPayload<T>(
 function installLegacyResponseFallback(
   pageWindow: Window & typeof globalThis,
   mode: Exclude<Mode, "off">,
-  observePayload?: ConversationPayloadObserver,
 ): { clear: () => void } {
   const marker = "__chatgptPerformanceFixResponseFallback";
   const existing = Reflect.get(pageWindow, marker) as
@@ -4098,8 +3415,6 @@ function installLegacyResponseFallback(
         console.warn(`[${SCRIPT_NAME}] Legacy response fallback failed`, error);
       }
 
-      observePayload?.(parsed);
-
       const value = { body, payload: parsed, fingerprint, stats };
       byUrl.set(response.url, value);
       while (byUrl.size > 8) {
@@ -4115,13 +3430,6 @@ function installLegacyResponseFallback(
 
   const patchedJson = function (this: Response): Promise<unknown> {
     if (!shouldHandle(this)) {
-      const match = matchConversationApiUrl(this.url, pageWindow.location.href);
-      if (!INTERNAL_RESPONSE_READS.has(this) && this.ok && match && match.kind !== "legacy-full" && observePayload) {
-        return nativeJson.call(this).then((payload) => {
-          try { observePayload(payload); } catch { /* Observation must not affect ChatGPT. */ }
-          return payload;
-        });
-      }
       return nativeJson.call(this);
     }
     return process(this).then((value) =>
@@ -4166,7 +3474,6 @@ async function materializeAndOptimize(
   response: Response,
   mode: Exclude<Mode, "off">,
   exposedUrl: string = response.url,
-  observePayload?: ConversationPayloadObserver,
 ): Promise<MaterializedResponse> {
   const originalBody = await readResponseText(response);
   let body = originalBody;
@@ -4184,7 +3491,6 @@ async function materializeAndOptimize(
       );
       stats = result.stats;
       activeConversation = !isIdleConversation(result.payload);
-      observePayload?.(result.payload);
       if (result.stats.changed) {
         body = JSON.stringify(result.payload);
         optimized = true;
@@ -4234,7 +3540,6 @@ async function materializeAndOptimizePaginated(
   createLocalCursor: () => string,
   workerJobToken?: string,
   renderTurns = MODE_OPTIONS[mode].paginatedRenderTurns,
-  observePayload?: ConversationPayloadObserver,
 ): Promise<MaterializedResponse> {
   const originalBody = await readResponseText(response);
   let body = originalBody;
@@ -4266,7 +3571,6 @@ async function materializeAndOptimizePaginated(
       cacheable = result.cacheable;
       activeConversation = result.active;
       optimizedPayload = result.payload;
-      observePayload?.(result.payload);
       registerStaticCodeBlocks(pageWindow, result.codeBlocks);
       if (result.stats.changed || workerJobToken) optimized = true;
       const chunksNewestFirst = result.chunks;
@@ -4685,7 +3989,6 @@ async function materializeLegacyRequestLazily(
   mode: Exclude<Mode, "off">,
   settings: StoredSettings,
   createLocalCursor: () => string,
-  observePayload?: ConversationPayloadObserver,
 ): Promise<MaterializedResponse> {
   if (settings.initialTurns === "all") {
     const legacyResponse = await originalFetch(input, { ...init, cache: "no-store" });
@@ -4694,7 +3997,6 @@ async function materializeLegacyRequestLazily(
       legacyResponse,
       mode,
       legacyUrl,
-      observePayload,
     );
     const headers = new pageWindow.Headers(materialized.headers);
     headers.set("x-chatgpt-performance-fix-initial-turns", "all");
@@ -4743,7 +4045,6 @@ async function materializeLegacyRequestLazily(
           createLocalCursor,
           undefined,
           MODE_OPTIONS[mode].paginatedRenderTurns,
-          observePayload,
         );
         const headers = new pageWindow.Headers(rateLimited.headers);
         headers.set("x-chatgpt-performance-fix-lazy", "rate-limited");
@@ -4768,7 +4069,6 @@ async function materializeLegacyRequestLazily(
       createLocalCursor,
       prepared.workerJobToken,
       initialTurns,
-      observePayload,
     );
     const optimizedNativePayload = await parseJsonOffMain<PaginatedConversationPayload>(
       pageWindow,
@@ -4816,7 +4116,6 @@ async function materializeLegacyRequestLazily(
       legacyResponse,
       mode,
       legacyUrl,
-      observePayload,
     );
   }
 }
@@ -4882,16 +4181,6 @@ function install(pageWindow: Window & typeof globalThis): void {
       },
     );
     GM_registerMenuCommand(
-      settings.showMessageMetadata
-        ? "隐藏消息时间与模型"
-        : "显示消息时间与模型",
-      () => {
-        settings.showMessageMetadata = !settings.showMessageMetadata;
-        writeSettings(pageWindow.localStorage, settings);
-        pageWindow.location.reload();
-      },
-    );
-    GM_registerMenuCommand(
       `切换模式（${settings.mode}）`,
       () => {
         const nextMode: Mode =
@@ -4926,13 +4215,9 @@ function install(pageWindow: Window & typeof globalThis): void {
   }
 
   const activeMode = settings.mode as Exclude<Mode, "off">;
-  const messageMetadataDisplay = settings.showMessageMetadata
-    ? installMessageMetadataDisplay(pageWindow)
-    : null;
   const responseFallback = installLegacyResponseFallback(
     pageWindow,
     activeMode,
-    messageMetadataDisplay?.ingestPayload,
   );
   installManualPaginationObserver(pageWindow, settings);
 
@@ -5171,7 +4456,6 @@ function install(pageWindow: Window & typeof globalThis): void {
       };
       const trackUserSend = mutationKind === "send" && probe.hasUserMessage;
       if (trackUserSend) {
-        messageMetadataDisplay?.noteOutgoing(probe);
         deliveryVerifier.begin(probe);
       }
       const mutationConversationId = mutationKind === "content"
@@ -5186,9 +4470,6 @@ function install(pageWindow: Window & typeof globalThis): void {
       clearLiveConversationCache(mutationConversationId);
       try {
         const response = await originalFetch(input, restoredInit);
-        if (mutationKind === "send" || mutationKind === "resume") {
-          messageMetadataDisplay?.observeResponse(response);
-        }
         if (trackUserSend) {
           if (response.ok) {
             deliveryVerifier.accepted(probe);
@@ -5276,7 +4557,6 @@ function install(pageWindow: Window & typeof globalThis): void {
       pageWindow.document.documentElement.dataset.chatgptModernHistoryMode = "manual";
       // Preserve the native cursor, batch size and response on the new renderer.
       const response = await originalFetch(input, init);
-      messageMetadataDisplay?.observeResponse(response);
       return response;
     }
 
@@ -5308,7 +4588,6 @@ function install(pageWindow: Window & typeof globalThis): void {
           activeMode,
           settings,
           createLocalCursor,
-          messageMetadataDisplay?.ingestPayload,
         );
         inFlight.set(key, task);
       }
@@ -5419,7 +4698,6 @@ function install(pageWindow: Window & typeof globalThis): void {
             createLocalCursor,
             prepared.workerJobToken,
             renderTurns,
-            messageMetadataDisplay?.ingestPayload,
           ),
         );
         inFlight.set(key, task);
